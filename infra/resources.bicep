@@ -28,7 +28,7 @@ resource openAi 'Microsoft.CognitiveServices/accounts@2024-10-01' = {
   sku: { name: 'S0' }
   properties: {
     customSubDomainName: 'oai-${token}' // required for Entra ID auth
-    disableLocalAuth: true // keys still exist, but every key-based call is rejected
+    disableLocalAuth: true // no key-based access; Azure won't even list the keys
     publicNetworkAccess: 'Enabled'
   }
 }
