@@ -1,0 +1,7 @@
+.azure/
+.env
+.git/
+.venv/
+__pycache__/
+docs/
+infra/

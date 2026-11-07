@@ -17,38 +17,44 @@ Each iteration has its own write-up in [`docs/iterations/`](docs/iterations/) co
 
 ## Getting started
 
-**Current iteration: [v0: Hello LLM](docs/iterations/v0.md)**
+**Current iteration: [v1: Real service](docs/iterations/v1.md)**
 
-At this stage the Azure resources are created by hand:
+You need the [Azure Developer CLI](https://learn.microsoft.com/azure/developer/azure-developer-cli/install-azd) (`azd`) and an Azure subscription where you can create role assignments (Owner or User Access Administrator).
 
 ```bash
-az group create -n rg-ai-demo -l eastus2
-
-az cognitiveservices account create -n contoso-aoai -g rg-ai-demo \
-  --kind OpenAI --sku S0 -l eastus2 --custom-domain contoso-aoai
-
-# Find an available model version for your region:
-#   az cognitiveservices account list-models -n contoso-aoai -g rg-ai-demo
-az cognitiveservices account deployment create -n contoso-aoai -g rg-ai-demo \
-  --deployment-name chat --model-name gpt-5-mini --model-format OpenAI \
-  --model-version <version> --sku-name GlobalStandard --sku-capacity 10
-
-az cognitiveservices account keys list -n contoso-aoai -g rg-ai-demo
+azd auth login
+azd up          # pick an environment name, a subscription and a region (e.g. eastus2)
 ```
 
-Then copy `.env.example` to `.env`, fill in the endpoint, key and deployment name, and run:
+`azd up` provisions everything in `infra/`, builds the container image in Azure and deploys it. When it finishes, try it:
 
 ```bash
+curl -X POST "$(azd env get-value SERVICE_API_URI)/chat" \
+  -H 'Content-Type: application/json' \
+  -d '{"question": "How do I connect a second monitor?"}'
+```
+
+To run the API locally against the same Azure OpenAI resource (it uses your `azd`/`az` login, no key):
+
+```bash
+python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-python hello.py
+azd env get-values > .env
+uvicorn app.main:app --reload --env-file .env    # then open http://localhost:8000/docs
+```
+
+When you're done, remove everything:
+
+```bash
+azd down --purge
 ```
 
 ## Roadmap
 
 | Tag | Iteration | Status |
 |---|---|---|
-| v0 | [Hello LLM](docs/iterations/v0.md) | ✅ current |
-| v1 | Real service: FastAPI, Container Apps, managed identity, `azd up` | planned |
+| v0 | [Hello LLM](docs/iterations/v0.md) | ✅ done |
+| v1 | [Real service: FastAPI, Container Apps, managed identity, `azd up`](docs/iterations/v1.md) | ✅ current |
 | v2 | Prompting done right: prompt files, structured outputs, streaming | planned |
 | v3 | Memory: conversation state, token-window trimming | planned |
 | v4 | Grounding: RAG with Azure AI Search and citations | planned |
