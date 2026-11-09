@@ -116,6 +116,18 @@ resource sessionsContainer 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/c
   }
 }
 
+// Stand-in for the ticketing system's own database: tickets the agent opens, password resets it does.
+resource servicedeskContainer 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers@2024-11-15' = {
+  parent: cosmosDb
+  name: 'servicedesk'
+  properties: {
+    resource: {
+      id: 'servicedesk'
+      partitionKey: { paths: ['/id'], kind: 'Hash' }
+    }
+  }
+}
+
 // Cosmos DB data access uses its own role system, not Azure RBAC. Scoped to the database, not the account.
 resource appCosmosAccess 'Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments@2024-11-15' = {
   parent: cosmos

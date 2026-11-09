@@ -17,7 +17,7 @@ Each iteration has its own write-up in [`docs/iterations/`](docs/iterations/) co
 
 ## Getting started
 
-**Current iteration: [v5: First tools](docs/iterations/v5.md)**
+**Current iteration: [v6: Agent framework and write actions](docs/iterations/v6.md)**
 
 You need the [Azure Developer CLI](https://learn.microsoft.com/azure/developer/azure-developer-cli/install-azd) (`azd`) and an Azure subscription where you can create role assignments (Owner or User Access Administrator).
 
@@ -49,7 +49,7 @@ curl $URL/sessions/<session_id>    # the full stored conversation
 curl -G $URL/search --data-urlencode "q=my laptop got stolen"
 ```
 
-The assistant has read-only tools: it searches the policies in `data/policies/` (indexed in Azure AI Search), looks up tickets and checks laptop warranties in a fake backend (`app/backend.py`; try tickets `INC0010001`–`INC0010005` and asset tags `CTSO-10442`, `CTSO-08817`, `CTSO-11950`, `CTSO-09323`). After changing a policy, update the index without redeploying:
+The assistant is an agent built on [Microsoft Agent Framework](https://learn.microsoft.com/agent-framework/). It searches the policies in `data/policies/` (indexed in Azure AI Search), looks up tickets and checks laptop warranties in a fake backend (`app/backend.py`; try tickets `INC0010001`–`INC0010005` and asset tags `CTSO-10442`, `CTSO-08817`, `CTSO-11950`, `CTSO-09323`), and it can open tickets and reset passwords (accounts `alex.kim@contoso.com`, `priya.natarajan@contoso.com`, `megan.bowen@contoso.com`). Nothing is real, but tickets and resets are stored in Cosmos DB. There are no safeguards yet: anyone can ask it to reset anyone's password. See [v6](docs/iterations/v6.md). After changing a policy, update the index without redeploying:
 
 ```bash
 set -a; eval "$(azd env get-values)"; set +a
@@ -58,7 +58,7 @@ python -m scripts.ingest
 
 Conversations are stored in Cosmos DB for 7 days after their last message. Only the newest messages that fit in `HISTORY_TOKEN_BUDGET` tokens (default 2000) are sent to the model.
 
-The system prompt lives in [`prompts/`](prompts/). Set `PROMPT_NAME` to use a different prompt file (default `helpdesk-v3`).
+The system prompt lives in [`prompts/`](prompts/). Set `PROMPT_NAME` to use a different prompt file (default `helpdesk-v4`).
 
 To run the API locally against the same Azure resources (it uses your `azd`/`az` login, no keys):
 
@@ -84,8 +84,8 @@ azd down --purge
 | v2 | [Prompting done right: prompt files, structured outputs, streaming](docs/iterations/v2.md) | ✅ done |
 | v3 | [Memory: conversation state in Cosmos DB, token-window trimming](docs/iterations/v3.md) | ✅ done |
 | v4 | [Grounding: RAG with Azure AI Search and citations](docs/iterations/v4.md) | ✅ done |
-| v5 | [First tools: hand-written agent loop with read-only tools](docs/iterations/v5.md) | ✅ current |
-| v6 | Agent framework + write actions | planned |
+| v5 | [First tools: hand-written agent loop with read-only tools](docs/iterations/v5.md) | ✅ done |
+| v6 | [Agent framework + write actions](docs/iterations/v6.md) | ✅ current |
 | v7 | Human-in-the-loop approval + least privilege (on-behalf-of user identity) | planned |
 | v8 | Safety: Prompt Shields for direct and indirect injection, groundedness | planned |
 | v9 | Observability: tracing, tokens and cost per request | planned |

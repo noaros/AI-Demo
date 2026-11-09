@@ -1,10 +1,16 @@
-"""A stand-in for Contoso's real systems: the Service Desk ticketing system and the asset database.
+"""A stand-in for Contoso's real systems: the Service Desk ticketing system, the asset database and the
+account directory.
 
-In production these would be API calls (ServiceNow, an asset DB). Keeping them in-process keeps the
-demo about the agent, not about integration. The data is fake.
+In production these would be API calls (ServiceNow, an asset DB, Entra ID). Keeping them in-process keeps
+the demo about the agent, not about integration. The data is fake. Tickets the agent opens and password
+resets it does are written to Cosmos DB, so they survive restarts like a real system would.
 """
 
-from datetime import date
+import secrets
+from datetime import UTC, date, datetime
+
+from azure.core.credentials import TokenCredential
+from azure.cosmos import CosmosClient, exceptions
 
 TICKETS = {
     "INC0010001": {
@@ -66,25 +72,75 @@ ASSETS = {
 }
 REFRESH_YEARS = 4  # IT-POL-003
 
+ACCOUNTS = {
+    "alex.kim@contoso.com": {"name": "Alex Kim", "title": "Marketing Specialist", "phone_ends_in": "42"},
+    "priya.natarajan@contoso.com": {"name": "Priya Natarajan", "title": "Service Desk Engineer", "phone_ends_in": "08"},
+    "megan.bowen@contoso.com": {"name": "Megan Bowen", "title": "Chief Executive Officer", "phone_ends_in": "17"},
+}
 
-def get_ticket(ticket_id: str) -> dict | None:
-    ticket = TICKETS.get(ticket_id.strip().upper())
-    return {"ticket_id": ticket_id.upper(), **ticket} if ticket else None
 
+class ServiceDesk:
+    def __init__(self, cosmos_endpoint: str, credential: TokenCredential):
+        database = CosmosClient(cosmos_endpoint, credential=credential).get_database_client("helpdesk")
+        self.store = database.get_container_client("servicedesk")
 
-def get_laptop(asset_tag: str) -> dict | None:
-    asset = ASSETS.get(asset_tag.strip().upper())
-    if not asset:
-        return None
-    purchased, today = asset["purchased"], date.today()
-    warranty_end = purchased.replace(year=purchased.year + asset["warranty_years"])
-    refresh_due = purchased.replace(year=purchased.year + REFRESH_YEARS)
-    return {
-        "asset_tag": asset_tag.upper(),
-        "model": asset["model"],
-        "purchased": purchased.isoformat(),
-        "warranty_end": warranty_end.isoformat(),
-        "in_warranty": today <= warranty_end,
-        "refresh_due": refresh_due.isoformat(),
-        "today": today.isoformat(),  # so the model doesn't have to guess what day it is
-    }
+    # ---------- read ----------
+
+    def get_ticket(self, ticket_id: str) -> dict | None:
+        ticket_id = ticket_id.strip().upper()
+        if ticket_id in TICKETS:
+            return {"ticket_id": ticket_id, **TICKETS[ticket_id]}
+        try:
+            doc = self.store.read_item(item=ticket_id, partition_key=ticket_id)
+        except exceptions.CosmosResourceNotFoundError:
+            return None
+        return {k: v for k, v in doc.items() if not k.startswith("_") and k not in ("id", "type")} | {"ticket_id": ticket_id}
+
+    def get_laptop(self, asset_tag: str) -> dict | None:
+        asset = ASSETS.get(asset_tag.strip().upper())
+        if not asset:
+            return None
+        purchased, today = asset["purchased"], date.today()
+        warranty_end = purchased.replace(year=purchased.year + asset["warranty_years"])
+        refresh_due = purchased.replace(year=purchased.year + REFRESH_YEARS)
+        return {
+            "asset_tag": asset_tag.upper(),
+            "model": asset["model"],
+            "purchased": purchased.isoformat(),
+            "warranty_end": warranty_end.isoformat(),
+            "in_warranty": today <= warranty_end,
+            "refresh_due": refresh_due.isoformat(),
+            "today": today.isoformat(),  # so the model doesn't have to guess what day it is
+        }
+
+    # ---------- write ----------
+
+    def create_ticket(self, title: str, description: str, priority: int) -> dict:
+        ticket_id = f"INC{secrets.randbelow(9_000_000) + 1_000_000:07d}"
+        ticket = {
+            "title": title,
+            "description": description,
+            "status": "New",
+            "priority": priority,
+            "opened": date.today().isoformat(),
+            "assigned_to": None,
+            "updates": [],
+        }
+        self.store.create_item({"id": ticket_id, "type": "ticket", **ticket})
+        return {"ticket_id": ticket_id, **ticket}
+
+    def reset_password(self, account: str) -> dict | None:
+        account = account.strip().lower()
+        person = ACCOUNTS.get(account)
+        if not person:
+            return None
+        reset_at = datetime.now(UTC).isoformat(timespec="seconds")
+        self.store.create_item({"id": f"reset-{secrets.token_hex(8)}", "type": "password_reset",
+                                "account": account, "reset_at": reset_at})
+        return {
+            "account": account,
+            "name": person["name"],
+            "reset_at": reset_at,
+            "result": f"Password reset. A temporary password was sent by text message to the phone number on file "
+            f"ending in {person['phone_ends_in']}. It must be changed at first sign-in.",
+        }
