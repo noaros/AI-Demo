@@ -9,6 +9,7 @@ var token = uniqueString(subscription().id, resourceGroup().id, location)
 // Built-in role definition IDs
 var acrPullRole = '7f951dda-4ed3-4680-a7ca-43fe172d538d'
 var openAiUserRole = '5e0bd9bd-7b93-4f28-af87-19fc36ad61bd' // Cognitive Services OpenAI User
+var cosmosDataContributorRole = '00000000-0000-0000-0000-000000000002' // Cosmos DB Built-in Data Contributor (data plane)
 
 // ---------- Identity: the app's own Entra ID identity, no secrets to manage ----------
 
@@ -59,6 +60,61 @@ resource devOpenAiAccess 'Microsoft.Authorization/roleAssignments@2022-04-01' = 
     principalId: principalId
     principalType: 'User'
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', openAiUserRole)
+  }
+}
+
+// ---------- Cosmos DB: conversation history, also with keys switched off ----------
+
+resource cosmos 'Microsoft.DocumentDB/databaseAccounts@2024-11-15' = {
+  name: 'cosmos-${token}'
+  location: location
+  tags: tags
+  kind: 'GlobalDocumentDB'
+  properties: {
+    databaseAccountOfferType: 'Standard'
+    locations: [{ locationName: location, failoverPriority: 0 }]
+    capabilities: [{ name: 'EnableServerless' }] // pay per request, nothing while idle
+    consistencyPolicy: { defaultConsistencyLevel: 'Session' }
+    disableLocalAuth: true // Entra ID only, like OpenAI
+  }
+}
+
+resource cosmosDb 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases@2024-11-15' = {
+  parent: cosmos
+  name: 'helpdesk'
+  properties: { resource: { id: 'helpdesk' } }
+}
+
+resource sessionsContainer 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers@2024-11-15' = {
+  parent: cosmosDb
+  name: 'sessions'
+  properties: {
+    resource: {
+      id: 'sessions'
+      partitionKey: { paths: ['/id'], kind: 'Hash' } // one session per partition: point reads and writes
+      defaultTtl: 604800 // Cosmos deletes a session 7 days after its last message
+    }
+  }
+}
+
+// Cosmos DB data access uses its own role system, not Azure RBAC. Scoped to the database, not the account.
+resource appCosmosAccess 'Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments@2024-11-15' = {
+  parent: cosmos
+  name: guid(cosmosDb.id, identity.id, cosmosDataContributorRole)
+  properties: {
+    principalId: identity.properties.principalId
+    roleDefinitionId: '${cosmos.id}/sqlRoleDefinitions/${cosmosDataContributorRole}'
+    scope: '${cosmos.id}/dbs/${cosmosDb.name}'
+  }
+}
+
+resource devCosmosAccess 'Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments@2024-11-15' = if (!empty(principalId)) {
+  parent: cosmos
+  name: guid(cosmosDb.id, principalId, cosmosDataContributorRole)
+  properties: {
+    principalId: principalId
+    roleDefinitionId: '${cosmos.id}/sqlRoleDefinitions/${cosmosDataContributorRole}'
+    scope: '${cosmos.id}/dbs/${cosmosDb.name}'
   }
 }
 
@@ -133,6 +189,7 @@ resource api 'Microsoft.App/containerApps@2024-03-01' = {
           env: [
             { name: 'AZURE_OPENAI_ENDPOINT', value: openAi.properties.endpoint }
             { name: 'AZURE_OPENAI_DEPLOYMENT', value: chatDeployment.name }
+            { name: 'AZURE_COSMOS_ENDPOINT', value: cosmos.properties.documentEndpoint }
             { name: 'AZURE_CLIENT_ID', value: identity.properties.clientId } // which identity DefaultAzureCredential uses
           ]
         }
@@ -145,4 +202,5 @@ resource api 'Microsoft.App/containerApps@2024-03-01' = {
 output registryLoginServer string = registry.properties.loginServer
 output openAiEndpoint string = openAi.properties.endpoint
 output openAiDeployment string = chatDeployment.name
+output cosmosEndpoint string = cosmos.properties.documentEndpoint
 output apiUri string = 'https://${api.properties.configuration.ingress.fqdn}'

@@ -39,4 +39,5 @@ module resources 'resources.bicep' = {
 output AZURE_CONTAINER_REGISTRY_ENDPOINT string = resources.outputs.registryLoginServer
 output AZURE_OPENAI_ENDPOINT string = resources.outputs.openAiEndpoint
 output AZURE_OPENAI_DEPLOYMENT string = resources.outputs.openAiDeployment
+output AZURE_COSMOS_ENDPOINT string = resources.outputs.cosmosEndpoint
 output SERVICE_API_URI string = resources.outputs.apiUri
