@@ -4,6 +4,7 @@ param principalId string
 param searchLocation string
 param apiExists bool
 param apiClientId string
+param contentSafetyLocation string
 param openAiModelName string
 param openAiModelVersion string
 param embeddingModelName string
@@ -14,6 +15,7 @@ var token = uniqueString(subscription().id, resourceGroup().id, location)
 // Built-in role definition IDs
 var acrPullRole = '7f951dda-4ed3-4680-a7ca-43fe172d538d'
 var openAiUserRole = '5e0bd9bd-7b93-4f28-af87-19fc36ad61bd' // Cognitive Services OpenAI User
+var cognitiveServicesUserRole = 'a97b65f3-24c7-4388-baec-2e87135dc908' // Cognitive Services User: call the APIs
 var cosmosDataContributorRole = '00000000-0000-0000-0000-000000000002' // Cosmos DB Built-in Data Contributor (data plane)
 var searchIndexReaderRole = '1407120a-92aa-4202-b7e9-c0e197c71c8f' // Search Index Data Reader: query only
 var searchIndexContributorRole = '8ebe5a00-799e-43f5-93ac-243d3dce84a7' // Search Index Data Contributor: load documents
@@ -188,6 +190,41 @@ resource devSearchAccess 'Microsoft.Authorization/roleAssignments@2022-04-01' = 
   }
 ]
 
+// ---------- Content Safety: checks for prompt attacks and ungrounded text ----------
+
+resource contentSafety 'Microsoft.CognitiveServices/accounts@2024-10-01' = {
+  name: 'cs-${token}'
+  location: contentSafetyLocation
+  tags: tags
+  kind: 'ContentSafety'
+  sku: { name: 'S0' } // pay per call
+  properties: {
+    customSubDomainName: 'cs-${token}' // required for Entra ID auth
+    disableLocalAuth: true // Entra ID only, like everything else
+    publicNetworkAccess: 'Enabled'
+  }
+}
+
+resource appContentSafetyAccess 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(contentSafety.id, identity.id, cognitiveServicesUserRole)
+  scope: contentSafety
+  properties: {
+    principalId: identity.properties.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', cognitiveServicesUserRole)
+  }
+}
+
+resource devContentSafetyAccess 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (!empty(principalId)) {
+  name: guid(contentSafety.id, principalId, cognitiveServicesUserRole)
+  scope: contentSafety
+  properties: {
+    principalId: principalId
+    principalType: 'User'
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', cognitiveServicesUserRole)
+  }
+}
+
 // ---------- Container registry: the app pulls its image with its identity ----------
 
 resource registry 'Microsoft.ContainerRegistry/registries@2023-07-01' = {
@@ -273,6 +310,7 @@ resource api 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'AZURE_SEARCH_ENDPOINT', value: 'https://${search.name}.search.windows.net' }
             { name: 'AUTH_TENANT_ID', value: tenant().tenantId } // users' tokens must come from this tenant...
             { name: 'AUTH_CLIENT_ID', value: apiClientId } // ...and be issued for this app
+            { name: 'CONTENT_SAFETY_ENDPOINT', value: contentSafety.properties.endpoint }
             { name: 'AZURE_CLIENT_ID', value: identity.properties.clientId } // which identity DefaultAzureCredential uses
           ]
         }
@@ -288,4 +326,5 @@ output openAiDeployment string = chatDeployment.name
 output cosmosEndpoint string = cosmos.properties.documentEndpoint
 output embeddingDeployment string = embeddingDeployment.name
 output searchEndpoint string = 'https://${search.name}.search.windows.net'
+output contentSafetyEndpoint string = contentSafety.properties.endpoint
 output apiUri string = 'https://${api.properties.configuration.ingress.fqdn}'

@@ -19,6 +19,7 @@ from app.backend import ServiceDesk
 from app.config import load_settings
 from app.memory import NotYours, SessionStore, trim_to_budget
 from app.prompts import load_prompt
+from app.safety import ContentSafety
 from app.search import MIN_RERANKER_SCORE, Passage, PolicySearch
 
 # Tool calls show in the container logs. Only our "agent" logger is turned up: at INFO, the Azure SDKs
@@ -46,6 +47,7 @@ policies = PolicySearch(
     settings.search_endpoint, credential, OpenAI(base_url=openai_base_url, api_key=token_provider),
     settings.embedding_deployment,
 )
+safety = ContentSafety(settings.content_safety_endpoint, async_token_provider, enabled=settings.safety_checks)
 agent = build_agent(
     AsyncOpenAI(base_url=openai_base_url, api_key=async_token_provider), settings.openai_deployment, prompt.text
 )
@@ -87,6 +89,7 @@ class Citation(BaseModel):
 class ToolCall(BaseModel):
     name: str
     arguments: dict
+    withheld: bool = False  # the result contained a prompt injection, so the model didn't see it
 
 
 class ChatResponse(HelpdeskAnswer):
@@ -102,6 +105,7 @@ class PendingAction(BaseModel):
     approval_id: str
     tool: str
     arguments: dict  # exactly what will run if approved
+    warnings: list[str] = []  # sentences the agent wrote that nothing the user said or a tool returned supports
 
 
 class ApprovalRequired(BaseModel):
@@ -138,11 +142,36 @@ def citations(answer: str, passages: list[Passage]) -> list[Citation]:
     return cited
 
 
-def pending_actions(response: AgentResponse) -> list[PendingAction]:
-    return [
-        PendingAction(approval_id=r.id, tool=r.function_call.name, arguments=r.function_call.parse_arguments() or {})
-        for r in response.user_input_requests
-    ]
+async def check_question(question: str) -> None:
+    if await safety.is_prompt_attack(question):
+        logging.getLogger("agent").warning("safety: blocked a prompt attack in the user's message")
+        raise HTTPException(400, "Blocked by Prompt Shields: this looks like an attempt to override the assistant's instructions")
+
+
+async def pending_actions(response: AgentResponse, user: User, said: list[str], tool_results: list[str]) -> list[PendingAction]:
+    """The actions waiting for approval, with warnings for the person approving them:
+    - a ticket description is checked against what the user said and the tools returned (groundedness),
+      so made-up sentences are pointed out;
+    - a password reset for someone else must name an account the user mentioned. If only a ticket or document
+      the agent read names it, the request may have been injected (provenance)."""
+    actions = []
+    for r in response.user_input_requests:
+        arguments = r.function_call.parse_arguments() or {}
+        warnings = []
+        if r.function_call.name == "create_ticket":
+            warnings += [f"Not supported by anything you said: \"{s}\""
+                         for s in await safety.ungrounded(arguments.get("description", ""), said + tool_results)]
+        if r.function_call.name == "reset_password":
+            account = arguments.get("account", "").lower()
+            if account != user.username and account not in " ".join(said).lower():
+                warnings.append(f"You never mentioned {account}: this request may come from content the agent "
+                                "read (a ticket or document), not from you.")
+        actions.append(PendingAction(approval_id=r.id, tool=r.function_call.name, arguments=arguments, warnings=warnings))
+    return actions
+
+
+def said_by_user(doc: dict, question: str) -> list[str]:
+    return [m["content"] for m in doc["messages"] if m["role"] == "user"] + [question]
 
 
 async def park_turn(doc: dict, user: User, question: str, session: AgentSession, toolbox: Toolbox,
@@ -155,6 +184,7 @@ async def park_turn(doc: dict, user: User, question: str, session: AgentSession,
         "session": session.to_dict(),
         "requests": [r.to_dict() for r in response.user_input_requests],
         "passages": [dataclasses.asdict(p) for p in toolbox.passages],
+        "results": toolbox.results,
         "history_sent": len(doc["messages"]),
     }
     await asyncio.to_thread(sessions.set_pending, doc["id"], user.id, pending)
@@ -173,7 +203,8 @@ async def answer_or_park(doc: dict, user: User, question: str, session: AgentSes
                          response: AgentResponse, history_sent: int) -> ChatResponse | ApprovalRequired:
     if response.user_input_requests:
         await park_turn(doc, user, question, session, toolbox, response)
-        return ApprovalRequired(session_id=doc["id"], actions=pending_actions(response), tool_calls=toolbox.calls)
+        actions = await pending_actions(response, user, said_by_user(doc, question), toolbox.results)
+        return ApprovalRequired(session_id=doc["id"], actions=actions, tool_calls=toolbox.calls)
     parsed = response.value
     if parsed is None:  # the model refused, or ran out of tokens mid-JSON
         raise HTTPException(status_code=502, detail="Model did not return a valid answer")
@@ -196,10 +227,11 @@ def healthz() -> dict:
 @app.post("/chat")
 async def chat(request: ChatRequest, user: User = Depends(current_user)) -> ChatResponse | ApprovalRequired:
     """For other systems: a typed answer they can route on, or the actions waiting for the user's approval."""
+    await check_question(request.question)
     doc = await asyncio.to_thread(load_session, request.session_id, user)  # Cosmos DB client is synchronous
     messages = start_turn(doc, request.question, user)
     session = agent.create_session()  # the framework's state for this turn; it holds pending approvals
-    toolbox = Toolbox(policies, desk, user)
+    toolbox = Toolbox(policies, desk, safety, user)
     response = await agent.run(
         messages,
         session=session,
@@ -224,7 +256,8 @@ async def approve(request: ApprovalRequest, user: User = Depends(current_user)) 
     # The framework only accepts these responses for requests its own session issued: a made-up approval for an
     # action the agent never asked for is ignored.
     session = AgentSession.from_dict(pending["session"])
-    toolbox = Toolbox(policies, desk, user, passages=[Passage(**p) for p in pending["passages"]])
+    toolbox = Toolbox(policies, desk, safety, user, passages=[Passage(**p) for p in pending["passages"]],
+                      results=pending["results"])
     response = await agent.run(
         [Message("user", [r.to_function_approval_response(request.decisions[r.id]) for r in requests])],
         session=session,
@@ -238,10 +271,11 @@ async def approve(request: ApprovalRequest, user: User = Depends(current_user)) 
 @app.post("/chat/stream")
 async def chat_stream(request: ChatRequest, user: User = Depends(current_user)) -> StreamingResponse:
     """For people: plain text that appears as it's generated, then the sources it cited."""
+    await check_question(request.question)
     doc = await asyncio.to_thread(load_session, request.session_id, user)
     messages = start_turn(doc, request.question, user)
     session = agent.create_session()
-    toolbox = Toolbox(policies, desk, user)
+    toolbox = Toolbox(policies, desk, safety, user)
     stream = agent.run(
         messages,
         stream=True,
@@ -258,8 +292,10 @@ async def chat_stream(request: ChatRequest, user: User = Depends(current_user)) 
         response = await stream.get_final_response()
         if response.user_input_requests:
             await park_turn(doc, user, request.question, session, toolbox, response)
+            actions = await pending_actions(response, user, said_by_user(doc, request.question), toolbox.results)
             yield "\n\nWaiting for your approval (POST /chat/approve):\n" + "".join(
-                f"- {a.approval_id}: {a.tool}({a.arguments})\n" for a in pending_actions(response)
+                f"- {a.approval_id}: {a.tool}({a.arguments})\n" + "".join(f"  ! {w}\n" for w in a.warnings)
+                for a in actions
             )
             return
         if cited := citations(response.text, toolbox.passages):

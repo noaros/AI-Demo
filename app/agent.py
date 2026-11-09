@@ -4,6 +4,7 @@ v5's hand-written loop (call the model, run the tools it asks for, append the re
 framework's job. What's left for us: the tools, the instructions, and middleware around tool calls.
 """
 
+import json
 import logging
 from typing import Annotated, Any, Literal
 
@@ -14,12 +15,20 @@ from pydantic import BaseModel, Field
 
 from app.auth import User
 from app.backend import ServiceDesk
+from app.safety import ContentSafety
 from app.search import Passage, PolicySearch
 
 log = logging.getLogger("agent")
 
 # Model calls per question. When it's reached, the framework stops offering tools and makes the model answer.
 MAX_STEPS = 5
+
+# Tools whose results contain text other people wrote: ticket descriptions, policy documents. Anyone who can
+# write a ticket can try to give the agent orders through it, so these results are checked before the model
+# reads them.
+UNTRUSTED_RESULTS = {"get_ticket", "search_policies"}
+WITHHELD = {"error": "This result was withheld: it contained instructions aimed at the assistant (a possible "
+                     "prompt injection). The Service Desk should review the source directly."}
 
 
 def build_agent(openai: AsyncOpenAI, deployment: str, instructions: str) -> Agent:
@@ -37,11 +46,14 @@ class Toolbox:
 
     `user` is never a tool argument: the model can't choose who it acts as. It comes from the verified token."""
 
-    def __init__(self, policies: PolicySearch, desk: ServiceDesk, user: User, passages: list[Passage] | None = None):
+    def __init__(self, policies: PolicySearch, desk: ServiceDesk, safety: ContentSafety, user: User,
+                 passages: list[Passage] | None = None, results: list[str] | None = None):
         self.policies = policies
         self.desk = desk
+        self.safety = safety
         self.user = user
-        self.passages: list[Passage] = passages or []  # every excerpt found this turn; [n] in the answer is passages[n-1]
+        self.passages: list[Passage] = passages or []
+        self.results: list[str] = results or []  # tool results the model saw: sources for groundedness checks  # every excerpt found this turn; [n] in the answer is passages[n-1]
         self.calls: list[dict] = []  # what the model asked for, returned to the caller for visibility
 
     # ---------- read ----------
@@ -110,10 +122,21 @@ class Toolbox:
         ]
 
     async def record_tool_call(self, context: FunctionInvocationContext, call_next) -> None:
-        """Function middleware: the framework runs this around every tool call."""
+        """Function middleware: the framework runs this around every tool call. Code before `call_next` runs
+        before the tool; code after it can inspect, and replace, the result before the model sees it."""
+        name = context.function.name
         arguments: Any = context.arguments
         if isinstance(arguments, BaseModel):
             arguments = arguments.model_dump()
-        self.calls.append({"name": context.function.name, "arguments": dict(arguments)})
-        log.info("tool call: %s(%s)", context.function.name, arguments)
+        call = {"name": name, "arguments": dict(arguments)}
+        self.calls.append(call)
+        log.info("tool call: %s(%s)", name, arguments)
         await call_next()
+
+        result = context.result if isinstance(context.result, str) else json.dumps(context.result, default=str)
+        if name in UNTRUSTED_RESULTS and await self.safety.has_injection(result):
+            log.warning("safety: withheld the result of %s(%s): prompt injection detected", name, arguments)
+            context.result = WITHHELD
+            call["withheld"] = True
+            return
+        self.results.append(result)

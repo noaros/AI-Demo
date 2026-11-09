@@ -17,7 +17,7 @@ Each iteration has its own write-up in [`docs/iterations/`](docs/iterations/) co
 
 ## Getting started
 
-**Current iteration: [v7: Approval and least privilege](docs/iterations/v7.md)**
+**Current iteration: [v8: Safety](docs/iterations/v8.md)**
 
 You need the [Azure Developer CLI](https://learn.microsoft.com/azure/developer/azure-developer-cli/install-azd) (`azd`), the [Azure CLI](https://learn.microsoft.com/cli/azure/install-azure-cli) (`az`), Python 3, an Azure subscription where you can create role assignments (Owner or User Access Administrator), and permission to create app registrations in its Entra ID tenant.
 
@@ -66,11 +66,13 @@ python -m scripts.agent_role add       # or: remove
 TOKEN=$(az account get-access-token --scope "api://$CID/.default" --query accessToken -o tsv)
 ```
 
+Messages and the text tools return are checked with Azure AI Content Safety: prompt attacks are blocked, injected instructions in tickets and documents are withheld from the model, and actions waiting for approval come with warnings (made-up ticket details, password resets for accounts you never mentioned). See [v8](docs/iterations/v8.md), including the injection that gets through Prompt Shields. Set `SAFETY_CHECKS=off` locally to see the attacks work.
+
 After changing a policy, update the index without redeploying (with the azd values exported as above): `python -m scripts.ingest`.
 
 Conversations are stored in Cosmos DB for 7 days after their last message. Only the newest messages that fit in `HISTORY_TOKEN_BUDGET` tokens (default 2000) are sent to the model.
 
-The system prompt lives in [`prompts/`](prompts/). Set `PROMPT_NAME` to use a different prompt file (default `helpdesk-v5`).
+The system prompt lives in [`prompts/`](prompts/). Set `PROMPT_NAME` to use a different prompt file (default `helpdesk-v6`).
 
 To run the API locally against the same Azure resources (it uses your `azd`/`az` login, no keys):
 
@@ -98,8 +100,8 @@ azd down --purge
 | v4 | [Grounding: RAG with Azure AI Search and citations](docs/iterations/v4.md) | ✅ done |
 | v5 | [First tools: hand-written agent loop with read-only tools](docs/iterations/v5.md) | ✅ done |
 | v6 | [Agent framework + write actions](docs/iterations/v6.md) | ✅ done |
-| v7 | [Human-in-the-loop approval + least privilege (signed-in user identity)](docs/iterations/v7.md) | ✅ current |
-| v8 | Safety: Prompt Shields for direct and indirect injection, groundedness | planned |
+| v7 | [Human-in-the-loop approval + least privilege (signed-in user identity)](docs/iterations/v7.md) | ✅ done |
+| v8 | [Safety: Prompt Shields for direct and indirect injection, groundedness](docs/iterations/v8.md) | ✅ current |
 | v9 | Observability: tracing, tokens and cost per request | planned |
 | v10 | Evaluations as a CI gate | planned |
 | v11 | Resilience and cost control: AI gateway, failover, caching, agent step limits | planned |

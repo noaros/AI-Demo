@@ -21,6 +21,9 @@ param apiExists bool = false
 @description('Application (client) id of the Entra ID app registration users sign in to. Set by the preprovision hook.')
 param apiClientId string
 
+@description('Region for Content Safety, if different: groundedness detection is only offered in some regions.')
+param contentSafetyLocation string = ''
+
 param openAiModelName string = 'gpt-5-mini'
 param openAiModelVersion string = '2025-08-07'
 param embeddingModelName string = 'text-embedding-3-small'
@@ -44,6 +47,7 @@ module resources 'resources.bicep' = {
     searchLocation: empty(searchLocation) ? location : searchLocation
     apiExists: apiExists
     apiClientId: apiClientId
+    contentSafetyLocation: empty(contentSafetyLocation) ? location : contentSafetyLocation
     openAiModelName: openAiModelName
     openAiModelVersion: openAiModelVersion
     embeddingModelName: embeddingModelName
@@ -60,4 +64,5 @@ output AZURE_OPENAI_EMBEDDING_DEPLOYMENT string = resources.outputs.embeddingDep
 output AZURE_SEARCH_ENDPOINT string = resources.outputs.searchEndpoint
 output AUTH_TENANT_ID string = tenant().tenantId
 output AUTH_CLIENT_ID string = apiClientId
+output CONTENT_SAFETY_ENDPOINT string = resources.outputs.contentSafetyEndpoint
 output SERVICE_API_URI string = resources.outputs.apiUri
