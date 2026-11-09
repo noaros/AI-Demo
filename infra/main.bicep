@@ -15,6 +15,9 @@ param principalId string = ''
 @description('Region for AI Search, if different: set AZURE_SEARCH_LOCATION when the main region has no Search capacity.')
 param searchLocation string = ''
 
+@description('Set by azd: true once the app has been deployed, so provisioning keeps its image.')
+param apiExists bool = false
+
 param openAiModelName string = 'gpt-5-mini'
 param openAiModelVersion string = '2025-08-07'
 param embeddingModelName string = 'text-embedding-3-small'
@@ -36,6 +39,7 @@ module resources 'resources.bicep' = {
     tags: tags
     principalId: principalId
     searchLocation: empty(searchLocation) ? location : searchLocation
+    apiExists: apiExists
     openAiModelName: openAiModelName
     openAiModelVersion: openAiModelVersion
     embeddingModelName: embeddingModelName

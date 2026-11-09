@@ -2,6 +2,7 @@ param location string
 param tags object
 param principalId string
 param searchLocation string
+param apiExists bool
 param openAiModelName string
 param openAiModelVersion string
 param embeddingModelName string
@@ -221,6 +222,15 @@ resource containerEnv 'Microsoft.App/managedEnvironments@2024-03-01' = {
   }
 }
 
+// Without this, every `azd provision` would replace the running app with the placeholder image below.
+module currentApi 'current-image.bicep' = {
+  name: 'current-api-image'
+  params: { name: 'ca-api-${token}', exists: apiExists }
+}
+var apiImage = empty(currentApi.outputs.image)
+  ? 'mcr.microsoft.com/azuredocs/containerapps-helloworld:latest' // replaced by `azd deploy`
+  : currentApi.outputs.image
+
 resource api 'Microsoft.App/containerApps@2024-03-01' = {
   name: 'ca-api-${token}'
   location: location
@@ -240,7 +250,7 @@ resource api 'Microsoft.App/containerApps@2024-03-01' = {
       containers: [
         {
           name: 'api'
-          image: 'mcr.microsoft.com/azuredocs/containerapps-helloworld:latest' // replaced by `azd deploy`
+          image: apiImage
           resources: { cpu: json('0.5'), memory: '1Gi' }
           env: [
             { name: 'AZURE_OPENAI_ENDPOINT', value: openAi.properties.endpoint }
