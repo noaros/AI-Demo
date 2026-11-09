@@ -10,6 +10,7 @@ from agent_framework import AgentResponse, AgentSession, Content, Message
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
+from opentelemetry import trace
 from openai import AsyncOpenAI, OpenAI
 from pydantic import BaseModel, Field
 
@@ -21,6 +22,8 @@ from app.memory import NotYours, SessionStore, trim_to_budget
 from app.prompts import load_prompt
 from app.safety import ContentSafety
 from app.search import MIN_RERANKER_SCORE, Passage, PolicySearch
+from app.telemetry import annotate, current_trace_id
+from app import telemetry
 
 # Tool calls show in the container logs. Only our "agent" logger is turned up: at INFO, the Azure SDKs
 # would log the headers of every Cosmos DB and AI Search request.
@@ -34,6 +37,7 @@ prompt = load_prompt(settings.prompt_name)
 # (or for your `az login` / `azd auth login` account when running locally).
 credential = DefaultAzureCredential()
 token_provider = get_bearer_token_provider(credential, "https://cognitiveservices.azure.com/.default")
+telemetry.setup(settings.appinsights_connection_string, credential)  # before FastAPI(): requests get traced
 
 
 async def async_token_provider() -> str:  # the async OpenAI client needs an async token function
@@ -53,6 +57,12 @@ agent = build_agent(
 )
 
 app = FastAPI(title="Contoso IT Helpdesk")
+
+
+@app.middleware("http")
+async def remember_request_span(request, call_next):
+    telemetry.request_span.set(trace.get_current_span())  # runs inside the request's span
+    return await call_next(request)
 
 
 class ChatRequest(BaseModel):
@@ -86,6 +96,12 @@ class Citation(BaseModel):
     section: str
 
 
+class Usage(BaseModel):
+    input_tokens: int
+    output_tokens: int  # includes reasoning tokens: they're billed as output
+    estimated_cost_usd: float  # chat model only, at the configured prices; embeddings and Content Safety not included
+
+
 class ToolCall(BaseModel):
     name: str
     arguments: dict
@@ -99,6 +115,8 @@ class ChatResponse(HelpdeskAnswer):
     history_sent: int  # earlier messages the model saw; older ones were trimmed to fit the token budget
     tool_calls: list[ToolCall]  # what the model looked up or did to answer, in order
     citations: list[Citation]
+    usage: Usage | None
+    trace_id: str  # find this request in Application Insights
 
 
 class PendingAction(BaseModel):
@@ -113,6 +131,8 @@ class ApprovalRequired(BaseModel):
     session_id: UUID
     actions: list[PendingAction]  # approve or reject each with POST /chat/approve
     tool_calls: list[ToolCall]  # what already ran: lookups don't need approval
+    usage: Usage | None
+    trace_id: str
 
 
 def load_session(session_id: UUID | None, user: User) -> dict:
@@ -142,8 +162,29 @@ def citations(answer: str, passages: list[Passage]) -> list[Citation]:
     return cited
 
 
+def usage_of(response: AgentResponse) -> Usage | None:
+    """Tokens for the whole turn (every model call in the loop), and what they cost."""
+    details = response.usage_details or {}
+    if details.get("input_token_count") is None:
+        return None
+    tokens_in, tokens_out = details["input_token_count"], details.get("output_token_count") or 0
+    cost = (tokens_in * settings.price_input_per_million + tokens_out * settings.price_output_per_million) / 1e6
+    return Usage(input_tokens=tokens_in, output_tokens=tokens_out, estimated_cost_usd=round(cost, 6))
+
+
+def record_turn(user: User, session_id: str, status: str, usage: Usage | None, toolbox: Toolbox) -> None:
+    """Puts what matters about this request on its span, so it can be queried: tokens, cost, outcome."""
+    annotate(
+        user_id=user.id, session_id=session_id, status=status, tool_calls=len(toolbox.calls),
+        withheld=sum(1 for c in toolbox.calls if c.get("withheld")),
+        input_tokens=usage.input_tokens if usage else None, output_tokens=usage.output_tokens if usage else None,
+        cost_usd=usage.estimated_cost_usd if usage else None,
+    )
+
+
 async def check_question(question: str) -> None:
     if await safety.is_prompt_attack(question):
+        annotate(blocked="prompt_attack")
         logging.getLogger("agent").warning("safety: blocked a prompt attack in the user's message")
         raise HTTPException(400, "Blocked by Prompt Shields: this looks like an attempt to override the assistant's instructions")
 
@@ -201,14 +242,18 @@ async def finish_turn(doc: dict, user: User, question: str, answer: str) -> None
 
 async def answer_or_park(doc: dict, user: User, question: str, session: AgentSession, toolbox: Toolbox,
                          response: AgentResponse, history_sent: int) -> ChatResponse | ApprovalRequired:
+    usage = usage_of(response)
     if response.user_input_requests:
         await park_turn(doc, user, question, session, toolbox, response)
         actions = await pending_actions(response, user, said_by_user(doc, question), toolbox.results)
-        return ApprovalRequired(session_id=doc["id"], actions=actions, tool_calls=toolbox.calls)
+        record_turn(user, doc["id"], "approval_required", usage, toolbox)
+        return ApprovalRequired(session_id=doc["id"], actions=actions, tool_calls=toolbox.calls, usage=usage,
+                                trace_id=current_trace_id())
     parsed = response.value
     if parsed is None:  # the model refused, or ran out of tokens mid-JSON
         raise HTTPException(status_code=502, detail="Model did not return a valid answer")
     await finish_turn(doc, user, question, parsed.answer)
+    record_turn(user, doc["id"], "answered", usage, toolbox)
     return ChatResponse(
         **parsed.model_dump(),
         prompt=prompt.name,
@@ -216,6 +261,8 @@ async def answer_or_park(doc: dict, user: User, question: str, session: AgentSes
         history_sent=history_sent,
         tool_calls=toolbox.calls,
         citations=citations(parsed.answer, toolbox.passages),
+        usage=usage,
+        trace_id=current_trace_id(),
     )
 
 
@@ -290,6 +337,8 @@ async def chat_stream(request: ChatRequest, user: User = Depends(current_user)) 
             if update.text:
                 yield update.text
         response = await stream.get_final_response()
+        record_turn(user, doc["id"], "approval_required" if response.user_input_requests else "answered",
+                    usage_of(response), toolbox)
         if response.user_input_requests:
             await park_turn(doc, user, request.question, session, toolbox, response)
             actions = await pending_actions(response, user, said_by_user(doc, request.question), toolbox.results)
@@ -303,7 +352,7 @@ async def chat_stream(request: ChatRequest, user: User = Depends(current_user)) 
         # Saved only once the whole answer has been sent; a dropped connection leaves no half answer.
         await finish_turn(doc, user, request.question, response.text)
 
-    headers = {"X-Session-Id": doc["id"], "X-History-Sent": str(len(messages) - 2)}
+    headers = {"X-Session-Id": doc["id"], "X-History-Sent": str(len(messages) - 2), "X-Trace-Id": current_trace_id()}
     return StreamingResponse(tokens(), media_type="text/plain; charset=utf-8", headers=headers)
 
 

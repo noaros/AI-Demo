@@ -16,6 +16,7 @@ var token = uniqueString(subscription().id, resourceGroup().id, location)
 var acrPullRole = '7f951dda-4ed3-4680-a7ca-43fe172d538d'
 var openAiUserRole = '5e0bd9bd-7b93-4f28-af87-19fc36ad61bd' // Cognitive Services OpenAI User
 var cognitiveServicesUserRole = 'a97b65f3-24c7-4388-baec-2e87135dc908' // Cognitive Services User: call the APIs
+var monitoringPublisherRole = '3913510d-42f4-4e42-8a64-420c390055eb' // Monitoring Metrics Publisher: send telemetry
 var cosmosDataContributorRole = '00000000-0000-0000-0000-000000000002' // Cosmos DB Built-in Data Contributor (data plane)
 var searchIndexReaderRole = '1407120a-92aa-4202-b7e9-c0e197c71c8f' // Search Index Data Reader: query only
 var searchIndexContributorRole = '8ebe5a00-799e-43f5-93ac-243d3dce84a7' // Search Index Data Contributor: load documents
@@ -257,6 +258,39 @@ resource logs 'Microsoft.OperationalInsights/workspaces@2023-09-01' = {
   }
 }
 
+// Traces, metrics and logs from the app, stored in the same Log Analytics workspace as the container logs.
+resource appInsights 'Microsoft.Insights/components@2020-02-02' = {
+  name: 'appi-${token}'
+  location: location
+  tags: tags
+  kind: 'web'
+  properties: {
+    Application_Type: 'web'
+    WorkspaceResourceId: logs.id
+    DisableLocalAuth: true // only Entra ID-authenticated telemetry is accepted, like everything else
+  }
+}
+
+resource appTelemetryAccess 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(appInsights.id, identity.id, monitoringPublisherRole)
+  scope: appInsights
+  properties: {
+    principalId: identity.properties.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', monitoringPublisherRole)
+  }
+}
+
+resource devTelemetryAccess 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (!empty(principalId)) {
+  name: guid(appInsights.id, principalId, monitoringPublisherRole)
+  scope: appInsights
+  properties: {
+    principalId: principalId
+    principalType: 'User'
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', monitoringPublisherRole)
+  }
+}
+
 resource containerEnv 'Microsoft.App/managedEnvironments@2024-03-01' = {
   name: 'cae-${token}'
   location: location
@@ -311,6 +345,7 @@ resource api 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'AUTH_TENANT_ID', value: tenant().tenantId } // users' tokens must come from this tenant...
             { name: 'AUTH_CLIENT_ID', value: apiClientId } // ...and be issued for this app
             { name: 'CONTENT_SAFETY_ENDPOINT', value: contentSafety.properties.endpoint }
+            { name: 'APPLICATIONINSIGHTS_CONNECTION_STRING', value: appInsights.properties.ConnectionString } // where to send, not a secret: sending needs the role
             { name: 'AZURE_CLIENT_ID', value: identity.properties.clientId } // which identity DefaultAzureCredential uses
           ]
         }
@@ -327,4 +362,5 @@ output cosmosEndpoint string = cosmos.properties.documentEndpoint
 output embeddingDeployment string = embeddingDeployment.name
 output searchEndpoint string = 'https://${search.name}.search.windows.net'
 output contentSafetyEndpoint string = contentSafety.properties.endpoint
+output appInsightsConnectionString string = appInsights.properties.ConnectionString
 output apiUri string = 'https://${api.properties.configuration.ingress.fqdn}'

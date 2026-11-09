@@ -13,6 +13,8 @@ from collections.abc import Awaitable, Callable
 
 import httpx
 
+from app.telemetry import tracer
+
 log = logging.getLogger("agent")
 
 SHIELD_API = "contentsafety/text:shieldPrompt?api-version=2024-09-01"
@@ -28,11 +30,20 @@ class ContentSafety:
         self.http = httpx.AsyncClient(timeout=10)
 
     async def _post(self, path: str, body: dict) -> dict:
-        response = await self.http.post(
-            self.endpoint + path, json=body, headers={"Authorization": f"Bearer {await self.token()}"}
-        )
-        response.raise_for_status()
-        return response.json()
+        # One span per check, so a trace shows what was checked, what was found and how long it took.
+        with tracer.start_as_current_span(f"content_safety {path.split(':')[1].split('?')[0]}") as span:
+            response = await self.http.post(
+                self.endpoint + path, json=body, headers={"Authorization": f"Bearer {await self.token()}"}
+            )
+            response.raise_for_status()
+            result = response.json()
+            detected = (
+                result.get("userPromptAnalysis", {}).get("attackDetected", False)
+                or any(d["attackDetected"] for d in result.get("documentsAnalysis", []))
+                or result.get("ungroundedDetected", False)
+            )
+            span.set_attribute("helpdesk.safety.detected", bool(detected))
+            return result
 
     async def is_prompt_attack(self, user_message: str) -> bool:
         if not self.enabled:

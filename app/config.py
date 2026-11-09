@@ -16,6 +16,9 @@ class Settings:
     auth_client_id: str
     content_safety_endpoint: str
     safety_checks: bool
+    appinsights_connection_string: str | None
+    price_input_per_million: float
+    price_output_per_million: float
     history_token_budget: int
 
 
@@ -31,5 +34,10 @@ def load_settings() -> Settings:
         auth_client_id=os.environ["AUTH_CLIENT_ID"],
         content_safety_endpoint=os.environ["CONTENT_SAFETY_ENDPOINT"],
         safety_checks=os.environ.get("SAFETY_CHECKS", "on") != "off",  # "off" only to demo the attacks
+        appinsights_connection_string=os.environ.get("APPLICATIONINSIGHTS_CONNECTION_STRING"),
+        # US$ per million tokens for the chat model, for cost estimates. Defaults: gpt-5-mini, Global Standard.
+        # Prices change: check https://azure.microsoft.com/pricing/details/cognitive-services/openai-service/
+        price_input_per_million=float(os.environ.get("PRICE_INPUT_PER_MILLION", "0.25")),
+        price_output_per_million=float(os.environ.get("PRICE_OUTPUT_PER_MILLION", "2.00")),
         history_token_budget=int(os.environ.get("HISTORY_TOKEN_BUDGET", "2000")),
     )

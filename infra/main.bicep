@@ -65,4 +65,5 @@ output AZURE_SEARCH_ENDPOINT string = resources.outputs.searchEndpoint
 output AUTH_TENANT_ID string = tenant().tenantId
 output AUTH_CLIENT_ID string = apiClientId
 output CONTENT_SAFETY_ENDPOINT string = resources.outputs.contentSafetyEndpoint
+output APPLICATIONINSIGHTS_CONNECTION_STRING string = resources.outputs.appInsightsConnectionString
 output SERVICE_API_URI string = resources.outputs.apiUri
