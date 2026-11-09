@@ -4,3 +4,4 @@ openai>=1.106
 azure-identity>=1.19
 azure-cosmos>=4.9
 tiktoken>=0.8
+azure-search-documents>=12.0

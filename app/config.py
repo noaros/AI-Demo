@@ -10,6 +10,8 @@ class Settings:
     openai_deployment: str
     prompt_name: str
     cosmos_endpoint: str
+    embedding_deployment: str
+    search_endpoint: str
     history_token_budget: int
 
 
@@ -17,7 +19,9 @@ def load_settings() -> Settings:
     return Settings(
         openai_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"].rstrip("/"),
         openai_deployment=os.environ["AZURE_OPENAI_DEPLOYMENT"],
-        prompt_name=os.environ.get("PROMPT_NAME", "helpdesk-v1"),
+        prompt_name=os.environ.get("PROMPT_NAME", "helpdesk-v2"),
         cosmos_endpoint=os.environ["AZURE_COSMOS_ENDPOINT"],
+        embedding_deployment=os.environ["AZURE_OPENAI_EMBEDDING_DEPLOYMENT"],
+        search_endpoint=os.environ["AZURE_SEARCH_ENDPOINT"],
         history_token_budget=int(os.environ.get("HISTORY_TOKEN_BUDGET", "2000")),
     )

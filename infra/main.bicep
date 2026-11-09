@@ -12,8 +12,13 @@ param location string
 @description('Object ID of the person running azd. Gets OpenAI access so the app can run locally.')
 param principalId string = ''
 
+@description('Region for AI Search, if different: set AZURE_SEARCH_LOCATION when the main region has no Search capacity.')
+param searchLocation string = ''
+
 param openAiModelName string = 'gpt-5-mini'
 param openAiModelVersion string = '2025-08-07'
+param embeddingModelName string = 'text-embedding-3-small'
+param embeddingModelVersion string = '1'
 
 var tags = { 'azd-env-name': environmentName }
 
@@ -30,8 +35,11 @@ module resources 'resources.bicep' = {
     location: location
     tags: tags
     principalId: principalId
+    searchLocation: empty(searchLocation) ? location : searchLocation
     openAiModelName: openAiModelName
     openAiModelVersion: openAiModelVersion
+    embeddingModelName: embeddingModelName
+    embeddingModelVersion: embeddingModelVersion
   }
 }
 
@@ -40,4 +48,6 @@ output AZURE_CONTAINER_REGISTRY_ENDPOINT string = resources.outputs.registryLogi
 output AZURE_OPENAI_ENDPOINT string = resources.outputs.openAiEndpoint
 output AZURE_OPENAI_DEPLOYMENT string = resources.outputs.openAiDeployment
 output AZURE_COSMOS_ENDPOINT string = resources.outputs.cosmosEndpoint
+output AZURE_OPENAI_EMBEDDING_DEPLOYMENT string = resources.outputs.embeddingDeployment
+output AZURE_SEARCH_ENDPOINT string = resources.outputs.searchEndpoint
 output SERVICE_API_URI string = resources.outputs.apiUri

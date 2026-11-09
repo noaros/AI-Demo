@@ -8,3 +8,8 @@ services:
     docker:
       path: Dockerfile
       remoteBuild: true # built in Azure Container Registry, so no local Docker needed
+hooks:
+  postprovision: # fill the search index once the infrastructure exists
+    posix:
+      shell: sh
+      run: ./scripts/ingest.sh

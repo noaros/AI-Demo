@@ -17,7 +17,7 @@ Each iteration has its own write-up in [`docs/iterations/`](docs/iterations/) co
 
 ## Getting started
 
-**Current iteration: [v3: Memory](docs/iterations/v3.md)**
+**Current iteration: [v4: Grounding](docs/iterations/v4.md)**
 
 You need the [Azure Developer CLI](https://learn.microsoft.com/azure/developer/azure-developer-cli/install-azd) (`azd`) and an Azure subscription where you can create role assignments (Owner or User Access Administrator).
 
@@ -26,14 +26,14 @@ azd auth login
 azd up          # pick an environment name, a subscription and a region (e.g. eastus2)
 ```
 
-`azd up` provisions everything in `infra/`, builds the container image in Azure and deploys it. When it finishes, try it:
+`azd up` provisions everything in `infra/`, fills the search index from [`data/policies/`](data/policies/), builds the container image in Azure and deploys it. If it fails with `InsufficientResourcesAvailable` on the search service, run `azd env set AZURE_SEARCH_LOCATION eastus` (or another region) and `azd up` again. When it finishes, try it:
 
 ```bash
 URL=$(azd env get-value SERVICE_API_URI)
 
-# Typed answer for other systems: answer, category, needs_human, prompt version
+# Typed answer for other systems: answer with [n] markers, citations, category, needs_human, ...
 curl -X POST $URL/chat -H 'Content-Type: application/json' \
-  -d '{"question": "My laptop screen is cracked"}'
+  -d '{"question": "Can contractors use the VPN?"}'
 
 # Plain text for people, streamed as it's written (-N turns off curl's buffering)
 curl -N -X POST $URL/chat/stream -H 'Content-Type: application/json' \
@@ -44,13 +44,23 @@ curl -N -X POST $URL/chat/stream -H 'Content-Type: application/json' \
 curl -X POST $URL/chat -H 'Content-Type: application/json' \
   -d '{"question": "What about a third one?", "session_id": "<session_id>"}'
 curl $URL/sessions/<session_id>    # the full stored conversation
+
+# What search finds for a query, with relevance scores
+curl -G $URL/search --data-urlencode "q=my laptop got stolen"
+```
+
+Answers about Contoso are grounded in the policies in `data/policies/`, which are indexed in Azure AI Search. After changing a policy, update the index without redeploying:
+
+```bash
+set -a; eval "$(azd env get-values)"; set +a
+python -m scripts.ingest
 ```
 
 Conversations are stored in Cosmos DB for 7 days after their last message. Only the newest messages that fit in `HISTORY_TOKEN_BUDGET` tokens (default 2000) are sent to the model.
 
-The system prompt lives in [`prompts/`](prompts/). Set `PROMPT_NAME` to use a different prompt file (default `helpdesk-v1`).
+The system prompt lives in [`prompts/`](prompts/). Set `PROMPT_NAME` to use a different prompt file (default `helpdesk-v2`).
 
-To run the API locally against the same Azure OpenAI and Cosmos DB resources (it uses your `azd`/`az` login, no keys):
+To run the API locally against the same Azure resources (it uses your `azd`/`az` login, no keys):
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
@@ -59,7 +69,7 @@ azd env get-values > .env
 uvicorn app.main:app --reload --env-file .env    # then open http://localhost:8000/docs
 ```
 
-When you're done, remove everything:
+When you're done, remove everything. AI Search bills by the hour even when idle, so don't leave it running:
 
 ```bash
 azd down --purge
@@ -72,8 +82,8 @@ azd down --purge
 | v0 | [Hello LLM](docs/iterations/v0.md) | ✅ done |
 | v1 | [Real service: FastAPI, Container Apps, managed identity, `azd up`](docs/iterations/v1.md) | ✅ done |
 | v2 | [Prompting done right: prompt files, structured outputs, streaming](docs/iterations/v2.md) | ✅ done |
-| v3 | [Memory: conversation state in Cosmos DB, token-window trimming](docs/iterations/v3.md) | ✅ current |
-| v4 | Grounding: RAG with Azure AI Search and citations | planned |
+| v3 | [Memory: conversation state in Cosmos DB, token-window trimming](docs/iterations/v3.md) | ✅ done |
+| v4 | [Grounding: RAG with Azure AI Search and citations](docs/iterations/v4.md) | ✅ current |
 | v5 | First tools: hand-written agent loop with read-only tools | planned |
 | v6 | Agent framework + write actions | planned |
 | v7 | Human-in-the-loop approval + least privilege (on-behalf-of user identity) | planned |
