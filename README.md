@@ -17,7 +17,7 @@ Each iteration has its own write-up in [`docs/iterations/`](docs/iterations/) co
 
 ## Getting started
 
-**Current iteration: [v1: Real service](docs/iterations/v1.md)**
+**Current iteration: [v2: Prompting done right](docs/iterations/v2.md)**
 
 You need the [Azure Developer CLI](https://learn.microsoft.com/azure/developer/azure-developer-cli/install-azd) (`azd`) and an Azure subscription where you can create role assignments (Owner or User Access Administrator).
 
@@ -29,10 +29,18 @@ azd up          # pick an environment name, a subscription and a region (e.g. ea
 `azd up` provisions everything in `infra/`, builds the container image in Azure and deploys it. When it finishes, try it:
 
 ```bash
-curl -X POST "$(azd env get-value SERVICE_API_URI)/chat" \
-  -H 'Content-Type: application/json' \
+URL=$(azd env get-value SERVICE_API_URI)
+
+# Typed answer for other systems: answer, category, needs_human, prompt version
+curl -X POST $URL/chat -H 'Content-Type: application/json' \
+  -d '{"question": "My laptop screen is cracked"}'
+
+# Plain text for people, streamed as it's written (-N turns off curl's buffering)
+curl -N -X POST $URL/chat/stream -H 'Content-Type: application/json' \
   -d '{"question": "How do I connect a second monitor?"}'
 ```
+
+The system prompt lives in [`prompts/`](prompts/). Set `PROMPT_NAME` to use a different prompt file (default `helpdesk-v1`).
 
 To run the API locally against the same Azure OpenAI resource (it uses your `azd`/`az` login, no key):
 
@@ -54,8 +62,8 @@ azd down --purge
 | Tag | Iteration | Status |
 |---|---|---|
 | v0 | [Hello LLM](docs/iterations/v0.md) | ✅ done |
-| v1 | [Real service: FastAPI, Container Apps, managed identity, `azd up`](docs/iterations/v1.md) | ✅ current |
-| v2 | Prompting done right: prompt files, structured outputs, streaming | planned |
+| v1 | [Real service: FastAPI, Container Apps, managed identity, `azd up`](docs/iterations/v1.md) | ✅ done |
+| v2 | [Prompting done right: prompt files, structured outputs, streaming](docs/iterations/v2.md) | ✅ current |
 | v3 | Memory: conversation state, token-window trimming | planned |
 | v4 | Grounding: RAG with Azure AI Search and citations | planned |
 | v5 | First tools: hand-written agent loop with read-only tools | planned |

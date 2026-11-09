@@ -8,10 +8,12 @@ class Settings:
 
     openai_endpoint: str
     openai_deployment: str
+    prompt_name: str
 
 
 def load_settings() -> Settings:
     return Settings(
         openai_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"].rstrip("/"),
         openai_deployment=os.environ["AZURE_OPENAI_DEPLOYMENT"],
+        prompt_name=os.environ.get("PROMPT_NAME", "helpdesk-v1"),
     )
