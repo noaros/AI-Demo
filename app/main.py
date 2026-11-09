@@ -1,6 +1,6 @@
+import logging
 import re
 from collections.abc import Iterator
-from dataclasses import dataclass
 from typing import Literal
 from uuid import UUID, uuid4
 
@@ -10,14 +10,19 @@ from fastapi.responses import StreamingResponse
 from openai import OpenAI
 from pydantic import BaseModel, Field
 
+from app import tools
 from app.config import load_settings
 from app.memory import SessionStore, trim_to_budget
 from app.prompts import load_prompt
 from app.search import MIN_RERANKER_SCORE, Passage, PolicySearch
 
+# Tool calls show in the container logs. Only our "agent" logger is turned up: at INFO, the Azure SDKs
+# would log the headers of every Cosmos DB and AI Search request.
+logging.basicConfig(format="%(name)s: %(message)s")
+logging.getLogger("agent").setLevel(logging.INFO)
+
 settings = load_settings()
 prompt = load_prompt(settings.prompt_name)
-rewrite_prompt = load_prompt("search-query-v1")
 
 # No API keys: the app gets short-lived Entra ID tokens for its managed identity
 # (or for your `az login` / `azd auth login` account when running locally).
@@ -26,6 +31,9 @@ token_provider = get_bearer_token_provider(credential, "https://cognitiveservice
 client = OpenAI(base_url=f"{settings.openai_endpoint}/openai/v1/", api_key=token_provider)
 sessions = SessionStore(settings.cosmos_endpoint, credential)
 policies = PolicySearch(settings.search_endpoint, credential, client, settings.embedding_deployment)
+
+# A model can keep asking for tools. Each step is a model call you pay for and wait for, so cap them.
+MAX_STEPS = 5
 
 app = FastAPI(title="Contoso IT Helpdesk")
 
@@ -56,52 +64,35 @@ class Citation(BaseModel):
     section: str
 
 
+class ToolCall(BaseModel):
+    name: str
+    arguments: dict
+
+
 class ChatResponse(HelpdeskAnswer):
     prompt: str  # which prompt file produced this answer
     session_id: UUID
     history_sent: int  # earlier messages the model saw; older ones were trimmed to fit the token budget
-    search_query: str  # what was searched for: the question, rewritten to stand alone if it was a follow-up
+    tool_calls: list[ToolCall]  # what the model looked up to answer, in order
     citations: list[Citation]
 
 
-@dataclass(frozen=True)
-class Turn:
-    session_id: str
-    history: list[dict]
-    search_query: str
-    passages: list[Passage]
-
-
-def standalone_query(question: str, history: list[dict]) -> str:
-    """"What about on a Mac?" finds nothing on its own. Rewrite follow-ups using the conversation."""
-    if not history:
-        return question  # a first question has nothing to resolve: skip the extra model call
-    completion = client.chat.completions.create(
-        model=settings.openai_deployment,
-        messages=[{"role": "system", "content": rewrite_prompt.text}, *history, {"role": "user", "content": question}],
-        reasoning_effort="minimal",
-    )
-    return (completion.choices[0].message.content or "").strip() or question
-
-
-def start_turn(request: ChatRequest) -> Turn:
-    """Loads the history that fits the token budget and finds the policy passages for the question."""
+def start_turn(request: ChatRequest) -> tuple[str, list[dict]]:
+    """Returns the session id and the start of the conversation sent to the model."""
     session_id = str(request.session_id or uuid4())
     history = trim_to_budget(sessions.history(session_id), settings.history_token_budget)
-    query = standalone_query(request.question, history)
-    return Turn(session_id, history, query, policies.find(query))
-
-
-def messages_for(question: str, turn: Turn) -> list[dict]:
-    excerpts = "\n\n".join(
-        f"[{n}] {p.title} ({p.policy_id}), {p.section}:\n{p.content}" for n, p in enumerate(turn.passages, 1)
-    )
-    return [
+    messages = [
         {"role": "system", "content": prompt.text},
-        *turn.history,
-        {"role": "system", "content": f"Contoso IT policy excerpts for this question:\n\n{excerpts or '(none found)'}"},
-        {"role": "user", "content": question},
+        *history,
+        {"role": "user", "content": request.question},
     ]
+    return session_id, messages
+
+
+def save_turn(session_id: str, question: str, answer: str) -> None:
+    # Only the question and the final answer are kept. Tool results are a snapshot (a ticket's status
+    # changes), so later turns look them up again instead of trusting an old copy.
+    sessions.append(session_id, {"role": "user", "content": question}, {"role": "assistant", "content": answer})
 
 
 def citations(answer: str, passages: list[Passage]) -> list[Citation]:
@@ -122,59 +113,75 @@ def healthz() -> dict:
 @app.post("/chat")
 def chat(request: ChatRequest) -> ChatResponse:
     """For other systems: a typed answer they can route on, guaranteed to match the schema."""
-    turn = start_turn(request)
-    completion = client.chat.completions.parse(
-        model=settings.openai_deployment,
-        messages=messages_for(request.question, turn),
-        response_format=HelpdeskAnswer,  # strict JSON schema, enforced by the service
-        reasoning_effort="low",  # enough thought to get category and needs_human right
-    )
-    parsed = completion.choices[0].message.parsed
+    session_id, messages = start_turn(request)
+    history_sent = len(messages) - 2
+    toolbox = tools.Toolbox(policies)
+
+    # The agent loop: call the model; if it asks for tools, run them, add the results and call it again.
+    # It ends when the model answers instead of asking for a tool.
+    for _ in range(MAX_STEPS):
+        completion = client.chat.completions.parse(
+            model=settings.openai_deployment,
+            messages=messages,
+            tools=tools.SCHEMAS,
+            response_format=HelpdeskAnswer,  # the shape of the final answer, once there are no more tool calls
+            reasoning_effort="low",
+        )
+        message = completion.choices[0].message
+        if not message.tool_calls:
+            break
+        toolbox.answer_tool_calls(message, messages)
+    else:
+        raise HTTPException(status_code=502, detail=f"No answer after {MAX_STEPS} steps")
+
+    parsed = message.parsed
     if parsed is None:  # the model refused, or ran out of tokens mid-JSON
         raise HTTPException(status_code=502, detail="Model did not return a valid answer")
-    sessions.append(
-        turn.session_id,
-        {"role": "user", "content": request.question},
-        {"role": "assistant", "content": parsed.answer},
-    )
+    save_turn(session_id, request.question, parsed.answer)
     return ChatResponse(
         **parsed.model_dump(),
         prompt=prompt.name,
-        session_id=turn.session_id,
-        history_sent=len(turn.history),
-        search_query=turn.search_query,
-        citations=citations(parsed.answer, turn.passages),
+        session_id=session_id,
+        history_sent=history_sent,
+        tool_calls=toolbox.calls,
+        citations=citations(parsed.answer, toolbox.passages),
     )
 
 
 @app.post("/chat/stream")
 def chat_stream(request: ChatRequest) -> StreamingResponse:
     """For people: plain text that appears as it's generated, then the sources it cited."""
-    turn = start_turn(request)
-    stream = client.chat.completions.create(
-        model=settings.openai_deployment,
-        messages=messages_for(request.question, turn),
-        reasoning_effort="minimal",  # reasoning happens before the first token; keep it short for people
-        stream=True,
-    )
+    session_id, messages = start_turn(request)
+    history_sent = len(messages) - 2
+    toolbox = tools.Toolbox(policies)
 
     def tokens() -> Iterator[str]:
-        answer = []
-        for chunk in stream:
-            if chunk.choices and chunk.choices[0].delta.content:
-                answer.append(chunk.choices[0].delta.content)
-                yield chunk.choices[0].delta.content
-        text = "".join(answer)
-        if cited := citations(text, turn.passages):
+        # The same loop, streamed: text is passed on as it arrives, tool calls are collected by the SDK.
+        for _ in range(MAX_STEPS):
+            with client.chat.completions.stream(
+                model=settings.openai_deployment,
+                messages=messages,
+                tools=tools.SCHEMAS,
+                reasoning_effort="minimal",  # reasoning happens before the first token; keep it short for people
+            ) as stream:
+                for event in stream:
+                    if event.type == "content.delta":
+                        yield event.delta
+                message = stream.get_final_completion().choices[0].message
+            if not message.tool_calls:
+                break
+            toolbox.answer_tool_calls(message, messages)
+        else:
+            yield f"\n\n(Stopped: no answer after {MAX_STEPS} steps.)"
+            return
+
+        answer = message.content or ""
+        if cited := citations(answer, toolbox.passages):
             yield "\n\nSources:\n" + "".join(f"[{c.number}] {c.title} ({c.policy_id}), {c.section}\n" for c in cited)
         # Saved only once the whole answer has been sent; a dropped connection leaves no half answer.
-        sessions.append(
-            turn.session_id,
-            {"role": "user", "content": request.question},
-            {"role": "assistant", "content": text},
-        )
+        save_turn(session_id, request.question, answer)
 
-    headers = {"X-Session-Id": turn.session_id, "X-History-Sent": str(len(turn.history))}
+    headers = {"X-Session-Id": session_id, "X-History-Sent": str(history_sent)}
     return StreamingResponse(tokens(), media_type="text/plain; charset=utf-8", headers=headers)
 
 

@@ -17,7 +17,7 @@ Each iteration has its own write-up in [`docs/iterations/`](docs/iterations/) co
 
 ## Getting started
 
-**Current iteration: [v4: Grounding](docs/iterations/v4.md)**
+**Current iteration: [v5: First tools](docs/iterations/v5.md)**
 
 You need the [Azure Developer CLI](https://learn.microsoft.com/azure/developer/azure-developer-cli/install-azd) (`azd`) and an Azure subscription where you can create role assignments (Owner or User Access Administrator).
 
@@ -31,9 +31,9 @@ azd up          # pick an environment name, a subscription and a region (e.g. ea
 ```bash
 URL=$(azd env get-value SERVICE_API_URI)
 
-# Typed answer for other systems: answer with [n] markers, citations, category, needs_human, ...
+# Typed answer for other systems: answer, the tools it used, citations, category, needs_human, ...
 curl -X POST $URL/chat -H 'Content-Type: application/json' \
-  -d '{"question": "Can contractors use the VPN?"}'
+  -d '{"question": "My laptop CTSO-10442 has a cracked screen. Is it covered?"}'
 
 # Plain text for people, streamed as it's written (-N turns off curl's buffering)
 curl -N -X POST $URL/chat/stream -H 'Content-Type: application/json' \
@@ -49,7 +49,7 @@ curl $URL/sessions/<session_id>    # the full stored conversation
 curl -G $URL/search --data-urlencode "q=my laptop got stolen"
 ```
 
-Answers about Contoso are grounded in the policies in `data/policies/`, which are indexed in Azure AI Search. After changing a policy, update the index without redeploying:
+The assistant has read-only tools: it searches the policies in `data/policies/` (indexed in Azure AI Search), looks up tickets and checks laptop warranties in a fake backend (`app/backend.py`; try tickets `INC0010001`–`INC0010005` and asset tags `CTSO-10442`, `CTSO-08817`, `CTSO-11950`, `CTSO-09323`). After changing a policy, update the index without redeploying:
 
 ```bash
 set -a; eval "$(azd env get-values)"; set +a
@@ -58,7 +58,7 @@ python -m scripts.ingest
 
 Conversations are stored in Cosmos DB for 7 days after their last message. Only the newest messages that fit in `HISTORY_TOKEN_BUDGET` tokens (default 2000) are sent to the model.
 
-The system prompt lives in [`prompts/`](prompts/). Set `PROMPT_NAME` to use a different prompt file (default `helpdesk-v2`).
+The system prompt lives in [`prompts/`](prompts/). Set `PROMPT_NAME` to use a different prompt file (default `helpdesk-v3`).
 
 To run the API locally against the same Azure resources (it uses your `azd`/`az` login, no keys):
 
@@ -83,8 +83,8 @@ azd down --purge
 | v1 | [Real service: FastAPI, Container Apps, managed identity, `azd up`](docs/iterations/v1.md) | ✅ done |
 | v2 | [Prompting done right: prompt files, structured outputs, streaming](docs/iterations/v2.md) | ✅ done |
 | v3 | [Memory: conversation state in Cosmos DB, token-window trimming](docs/iterations/v3.md) | ✅ done |
-| v4 | [Grounding: RAG with Azure AI Search and citations](docs/iterations/v4.md) | ✅ current |
-| v5 | First tools: hand-written agent loop with read-only tools | planned |
+| v4 | [Grounding: RAG with Azure AI Search and citations](docs/iterations/v4.md) | ✅ done |
+| v5 | [First tools: hand-written agent loop with read-only tools](docs/iterations/v5.md) | ✅ current |
 | v6 | Agent framework + write actions | planned |
 | v7 | Human-in-the-loop approval + least privilege (on-behalf-of user identity) | planned |
 | v8 | Safety: Prompt Shields for direct and indirect injection, groundedness | planned |
