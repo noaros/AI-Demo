@@ -3,6 +3,7 @@ param tags object
 param principalId string
 param searchLocation string
 param apiExists bool
+param apiClientId string
 param openAiModelName string
 param openAiModelVersion string
 param embeddingModelName string
@@ -270,6 +271,8 @@ resource api 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'AZURE_COSMOS_ENDPOINT', value: cosmos.properties.documentEndpoint }
             { name: 'AZURE_OPENAI_EMBEDDING_DEPLOYMENT', value: embeddingDeployment.name }
             { name: 'AZURE_SEARCH_ENDPOINT', value: 'https://${search.name}.search.windows.net' }
+            { name: 'AUTH_TENANT_ID', value: tenant().tenantId } // users' tokens must come from this tenant...
+            { name: 'AUTH_CLIENT_ID', value: apiClientId } // ...and be issued for this app
             { name: 'AZURE_CLIENT_ID', value: identity.properties.clientId } // which identity DefaultAzureCredential uses
           ]
         }

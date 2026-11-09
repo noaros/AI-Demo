@@ -18,6 +18,9 @@ param searchLocation string = ''
 @description('Set by azd: true once the app has been deployed, so provisioning keeps its image.')
 param apiExists bool = false
 
+@description('Application (client) id of the Entra ID app registration users sign in to. Set by the preprovision hook.')
+param apiClientId string
+
 param openAiModelName string = 'gpt-5-mini'
 param openAiModelVersion string = '2025-08-07'
 param embeddingModelName string = 'text-embedding-3-small'
@@ -40,6 +43,7 @@ module resources 'resources.bicep' = {
     principalId: principalId
     searchLocation: empty(searchLocation) ? location : searchLocation
     apiExists: apiExists
+    apiClientId: apiClientId
     openAiModelName: openAiModelName
     openAiModelVersion: openAiModelVersion
     embeddingModelName: embeddingModelName
@@ -54,4 +58,6 @@ output AZURE_OPENAI_DEPLOYMENT string = resources.outputs.openAiDeployment
 output AZURE_COSMOS_ENDPOINT string = resources.outputs.cosmosEndpoint
 output AZURE_OPENAI_EMBEDDING_DEPLOYMENT string = resources.outputs.embeddingDeployment
 output AZURE_SEARCH_ENDPOINT string = resources.outputs.searchEndpoint
+output AUTH_TENANT_ID string = tenant().tenantId
+output AUTH_CLIENT_ID string = apiClientId
 output SERVICE_API_URI string = resources.outputs.apiUri

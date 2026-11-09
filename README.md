@@ -17,48 +17,60 @@ Each iteration has its own write-up in [`docs/iterations/`](docs/iterations/) co
 
 ## Getting started
 
-**Current iteration: [v6: Agent framework and write actions](docs/iterations/v6.md)**
+**Current iteration: [v7: Approval and least privilege](docs/iterations/v7.md)**
 
-You need the [Azure Developer CLI](https://learn.microsoft.com/azure/developer/azure-developer-cli/install-azd) (`azd`) and an Azure subscription where you can create role assignments (Owner or User Access Administrator).
+You need the [Azure Developer CLI](https://learn.microsoft.com/azure/developer/azure-developer-cli/install-azd) (`azd`), the [Azure CLI](https://learn.microsoft.com/cli/azure/install-azure-cli) (`az`), Python 3, an Azure subscription where you can create role assignments (Owner or User Access Administrator), and permission to create app registrations in its Entra ID tenant.
 
 ```bash
+az login
 azd auth login
 azd up          # pick an environment name, a subscription and a region (e.g. eastus2)
 ```
 
-`azd up` provisions everything in `infra/`, fills the search index from [`data/policies/`](data/policies/), builds the container image in Azure and deploys it. If it fails with `InsufficientResourcesAvailable` on the search service, run `azd env set AZURE_SEARCH_LOCATION eastus` (or another region) and `azd up` again. When it finishes, try it:
+`azd up` creates an Entra ID app registration for the API, provisions everything in `infra/`, fills the search index from [`data/policies/`](data/policies/), builds the container image in Azure and deploys it. If it fails with `InsufficientResourcesAvailable` on the search service, run `azd env set AZURE_SEARCH_LOCATION eastus` (or another region) and `azd up` again.
+
+Every endpoint except `/healthz` needs a signed-in user's token. Get one with Azure CLI, then try it:
 
 ```bash
 URL=$(azd env get-value SERVICE_API_URI)
+CID=$(azd env get-value AZURE_API_CLIENT_ID)
+TOKEN=$(az account get-access-token --scope "api://$CID/Helpdesk.Chat" --query accessToken -o tsv)
+AUTH="Authorization: Bearer $TOKEN"
 
 # Typed answer for other systems: answer, the tools it used, citations, category, needs_human, ...
-curl -X POST $URL/chat -H 'Content-Type: application/json' \
+curl -X POST $URL/chat -H "$AUTH" -H 'Content-Type: application/json' \
   -d '{"question": "My laptop CTSO-10442 has a cracked screen. Is it covered?"}'
 
 # Plain text for people, streamed as it's written (-N turns off curl's buffering)
-curl -N -X POST $URL/chat/stream -H 'Content-Type: application/json' \
+curl -N -X POST $URL/chat/stream -H "$AUTH" -H 'Content-Type: application/json' \
   -d '{"question": "How do I connect a second monitor?"}'
 
-# Continue a conversation: send back the session_id from the previous answer
-# (/chat/stream returns it in the X-Session-Id header)
-curl -X POST $URL/chat -H 'Content-Type: application/json' \
-  -d '{"question": "What about a third one?", "session_id": "<session_id>"}'
-curl $URL/sessions/<session_id>    # the full stored conversation
+# Actions need your approval: this returns "approval_required" with the exact action and an approval_id
+curl -X POST $URL/chat -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"question": "Please reset my password"}'
+curl -X POST $URL/chat/approve -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"session_id": "<session_id>", "decisions": {"<approval_id>": true}}'
+
+# Continue a conversation: send back the session_id (/chat/stream returns it in the X-Session-Id header)
+curl $URL/sessions/<session_id> -H "$AUTH"    # your stored conversation
 
 # What search finds for a query, with relevance scores
-curl -G $URL/search --data-urlencode "q=my laptop got stolen"
+curl -G $URL/search -H "$AUTH" --data-urlencode "q=my laptop got stolen"
 ```
 
-The assistant is an agent built on [Microsoft Agent Framework](https://learn.microsoft.com/agent-framework/). It searches the policies in `data/policies/` (indexed in Azure AI Search), looks up tickets and checks laptop warranties in a fake backend (`app/backend.py`; try tickets `INC0010001`–`INC0010005` and asset tags `CTSO-10442`, `CTSO-08817`, `CTSO-11950`, `CTSO-09323`), and it can open tickets and reset passwords (accounts `alex.kim@contoso.com`, `priya.natarajan@contoso.com`, `megan.bowen@contoso.com`). Nothing is real, but tickets and resets are stored in Cosmos DB. There are no safeguards yet: anyone can ask it to reset anyone's password. See [v6](docs/iterations/v6.md). After changing a policy, update the index without redeploying:
+The assistant is an agent built on [Microsoft Agent Framework](https://learn.microsoft.com/agent-framework/). It searches the policies in `data/policies/` (indexed in Azure AI Search), looks up tickets and checks laptop warranties in a fake backend (`app/backend.py`; try asset tags `CTSO-10442`, `CTSO-08817`, `CTSO-11950`, `CTSO-09323`), and it can open tickets and reset passwords. Nothing is real, but tickets and resets are stored in Cosmos DB. It acts as the signed-in user: you can see your own tickets and reset your own password. Service Desk staff, with the `Helpdesk.Agent` app role, can see every ticket (`INC0010001`–`INC0010005` belong to fake users) and reset anyone's password. To try that, give yourself the role and get a fresh token:
 
 ```bash
 set -a; eval "$(azd env get-values)"; set +a
-python -m scripts.ingest
+python -m scripts.agent_role add       # or: remove
+TOKEN=$(az account get-access-token --scope "api://$CID/.default" --query accessToken -o tsv)
 ```
+
+After changing a policy, update the index without redeploying (with the azd values exported as above): `python -m scripts.ingest`.
 
 Conversations are stored in Cosmos DB for 7 days after their last message. Only the newest messages that fit in `HISTORY_TOKEN_BUDGET` tokens (default 2000) are sent to the model.
 
-The system prompt lives in [`prompts/`](prompts/). Set `PROMPT_NAME` to use a different prompt file (default `helpdesk-v4`).
+The system prompt lives in [`prompts/`](prompts/). Set `PROMPT_NAME` to use a different prompt file (default `helpdesk-v5`).
 
 To run the API locally against the same Azure resources (it uses your `azd`/`az` login, no keys):
 
@@ -66,10 +78,10 @@ To run the API locally against the same Azure resources (it uses your `azd`/`az`
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 azd env get-values > .env
-uvicorn app.main:app --reload --env-file .env    # then open http://localhost:8000/docs
+uvicorn app.main:app --reload --env-file .env    # then call http://localhost:8000 with the same token
 ```
 
-When you're done, remove everything. AI Search bills by the hour even when idle, so don't leave it running:
+When you're done, remove everything. AI Search bills by the hour even when idle, so don't leave it running. `azd down` also deletes the app registration:
 
 ```bash
 azd down --purge
@@ -85,8 +97,8 @@ azd down --purge
 | v3 | [Memory: conversation state in Cosmos DB, token-window trimming](docs/iterations/v3.md) | ✅ done |
 | v4 | [Grounding: RAG with Azure AI Search and citations](docs/iterations/v4.md) | ✅ done |
 | v5 | [First tools: hand-written agent loop with read-only tools](docs/iterations/v5.md) | ✅ done |
-| v6 | [Agent framework + write actions](docs/iterations/v6.md) | ✅ current |
-| v7 | Human-in-the-loop approval + least privilege (on-behalf-of user identity) | planned |
+| v6 | [Agent framework + write actions](docs/iterations/v6.md) | ✅ done |
+| v7 | [Human-in-the-loop approval + least privilege (signed-in user identity)](docs/iterations/v7.md) | ✅ current |
 | v8 | Safety: Prompt Shields for direct and indirect injection, groundedness | planned |
 | v9 | Observability: tracing, tokens and cost per request | planned |
 | v10 | Evaluations as a CI gate | planned |

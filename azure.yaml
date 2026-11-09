@@ -9,7 +9,15 @@ services:
       path: Dockerfile
       remoteBuild: true # built in Azure Container Registry, so no local Docker needed
 hooks:
+  preprovision: # the Entra ID app registration users sign in to; its id goes into the infrastructure
+    posix:
+      shell: sh
+      run: ./scripts/run.sh setup_auth
   postprovision: # fill the search index once the infrastructure exists
     posix:
       shell: sh
-      run: ./scripts/ingest.sh
+      run: ./scripts/run.sh ingest
+  postdown: # app registrations live in Entra ID, not in the resource group: delete it separately
+    posix:
+      shell: sh
+      run: '[ -n "$AZURE_API_CLIENT_ID" ] && az ad app delete --id "$AZURE_API_CLIENT_ID" || true'

@@ -12,6 +12,7 @@ from agent_framework.openai import OpenAIChatCompletionClient
 from openai import AsyncOpenAI
 from pydantic import BaseModel, Field
 
+from app.auth import User
 from app.backend import ServiceDesk
 from app.search import Passage, PolicySearch
 
@@ -31,13 +32,16 @@ def build_agent(openai: AsyncOpenAI, deployment: str, instructions: str) -> Agen
 
 
 class Toolbox:
-    """The tools for one question. The framework builds each tool's schema from the method's signature:
-    the type hints and Field descriptions, just as the Pydantic models did in v5."""
+    """The tools for one question, acting as one user. The framework builds each tool's schema from the method's
+    signature: the type hints and Field descriptions, just as the Pydantic models did in v5.
 
-    def __init__(self, policies: PolicySearch, desk: ServiceDesk):
+    `user` is never a tool argument: the model can't choose who it acts as. It comes from the verified token."""
+
+    def __init__(self, policies: PolicySearch, desk: ServiceDesk, user: User, passages: list[Passage] | None = None):
         self.policies = policies
         self.desk = desk
-        self.passages: list[Passage] = []  # every excerpt found this turn; [n] in the answer is passages[n-1]
+        self.user = user
+        self.passages: list[Passage] = passages or []  # every excerpt found this turn; [n] in the answer is passages[n-1]
         self.calls: list[dict] = []  # what the model asked for, returned to the caller for visibility
 
     # ---------- read ----------
@@ -58,7 +62,7 @@ class Toolbox:
         }
 
     def get_ticket(self, ticket_id: Annotated[str, Field(description="Ticket number, like INC0010001.")]) -> dict:
-        return self.desk.get_ticket(ticket_id) or {"error": f"No ticket {ticket_id} found."}
+        return self.desk.get_ticket(ticket_id, self.user) or {"error": f"No ticket {ticket_id} found that you can see."}
 
     def check_laptop_warranty(
         self, asset_tag: Annotated[str, Field(description="Asset tag from the sticker on the laptop, like CTSO-10442.")]
@@ -74,12 +78,15 @@ class Toolbox:
         priority: Annotated[Literal[1, 2, 3, 4], Field(description="1: a team or critical system is down. 2: one person "
                                                        "can't work. 3: a problem with a workaround. 4: a request.")],
     ) -> dict:
-        return self.desk.create_ticket(title, description, priority)
+        return self.desk.create_ticket(title, description, priority, self.user)
 
     def reset_password(
         self, account: Annotated[str, Field(description="The Contoso account's email address, like alex.kim@contoso.com.")]
     ) -> dict:
-        return self.desk.reset_password(account) or {"error": f"No Contoso account {account} found."}
+        try:
+            return self.desk.reset_password(account, self.user)
+        except (PermissionError, LookupError) as e:
+            return {"error": str(e)}
 
     # ---------- wiring ----------
 
@@ -93,9 +100,11 @@ class Toolbox:
                  description="Look up a Service Desk ticket: status, priority, owner, updates."),
             tool(self.check_laptop_warranty, name="check_laptop_warranty",
                  description="Look up a Contoso laptop by asset tag: model, purchase date, warranty end, refresh date."),
-            tool(self.create_ticket, name="create_ticket",
-                 description="Open a new Service Desk ticket. Returns the new ticket number."),
-            tool(self.reset_password, name="reset_password",
+            # These two change things, so a person must approve each call: the framework stops before running
+            # them and returns an approval request instead. See /chat/approve.
+            tool(self.create_ticket, name="create_ticket", approval_mode="always_require",
+                 description="Open a new Service Desk ticket in the user's name. Returns the new ticket number."),
+            tool(self.reset_password, name="reset_password", approval_mode="always_require",
                  description="Reset a Contoso account's password. A temporary password is sent by text message "
                  "to the phone number on file."),
         ]

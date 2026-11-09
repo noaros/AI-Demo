@@ -4,6 +4,10 @@ account directory.
 In production these would be API calls (ServiceNow, an asset DB, Entra ID). Keeping them in-process keeps
 the demo about the agent, not about integration. The data is fake. Tickets the agent opens and password
 resets it does are written to Cosmos DB, so they survive restarts like a real system would.
+
+Every method takes the caller: the signed-in user, from their verified token. The backend decides what that
+user may see and do, as a real system would with their identity. In production the app would call those
+systems on behalf of the user (an Entra ID on-behalf-of token), and they would enforce the same rules.
 """
 
 import secrets
@@ -12,8 +16,11 @@ from datetime import UTC, date, datetime
 from azure.core.credentials import TokenCredential
 from azure.cosmos import CosmosClient, exceptions
 
+from app.auth import User
+
 TICKETS = {
     "INC0010001": {
+        "requester": "alex.kim@contoso.com",
         "title": "Outlook keeps asking for my password",
         "status": "In progress",
         "priority": 3,
@@ -25,6 +32,7 @@ TICKETS = {
         ],
     },
     "INC0010002": {
+        "requester": "alex.kim@contoso.com",
         "title": "Cracked laptop screen",
         "status": "Waiting for parts",
         "priority": 3,
@@ -33,6 +41,7 @@ TICKETS = {
         "updates": ["2026-11-04: Accidental damage claim approved. Onsite repair booked for 2026-11-12."],
     },
     "INC0010003": {
+        "requester": "priya.natarajan@contoso.com",
         "title": "VPN disconnects every hour",
         "status": "Resolved",
         "priority": 3,
@@ -41,6 +50,7 @@ TICKETS = {
         "updates": ["2026-10-22: GlobalProtect updated to 6.3 by Intune. User confirmed it's fixed."],
     },
     "INC0010004": {
+        "requester": "alex.kim@contoso.com",
         "title": "Request: second monitor for home",
         "status": "Closed",
         "priority": 4,
@@ -49,6 +59,7 @@ TICKETS = {
         "updates": ["2026-10-29: IT doesn't provide second monitors for home (IT-POL-013). Use the home office allowance."],
     },
     "INC0010005": {
+        "requester": "megan.bowen@contoso.com",
         "title": "Can't open the HR portal",
         "status": "New",
         "priority": 2,
@@ -86,15 +97,19 @@ class ServiceDesk:
 
     # ---------- read ----------
 
-    def get_ticket(self, ticket_id: str) -> dict | None:
+    def get_ticket(self, ticket_id: str, caller: User) -> dict | None:
+        """Your own tickets; Service Desk agents see all. Someone else's ticket looks the same as no ticket."""
         ticket_id = ticket_id.strip().upper()
         if ticket_id in TICKETS:
-            return {"ticket_id": ticket_id, **TICKETS[ticket_id]}
-        try:
-            doc = self.store.read_item(item=ticket_id, partition_key=ticket_id)
-        except exceptions.CosmosResourceNotFoundError:
-            return None
-        return {k: v for k, v in doc.items() if not k.startswith("_") and k not in ("id", "type")} | {"ticket_id": ticket_id}
+            ticket = {"ticket_id": ticket_id, **TICKETS[ticket_id]}
+        else:
+            try:
+                doc = self.store.read_item(item=ticket_id, partition_key=ticket_id)
+            except exceptions.CosmosResourceNotFoundError:
+                return None
+            ticket = {k: v for k, v in doc.items() if not k.startswith("_") and k not in ("id", "type")}
+            ticket["ticket_id"] = ticket_id
+        return ticket if caller.is_agent or ticket.get("requester") == caller.username else None
 
     def get_laptop(self, asset_tag: str) -> dict | None:
         asset = ASSETS.get(asset_tag.strip().upper())
@@ -115,9 +130,10 @@ class ServiceDesk:
 
     # ---------- write ----------
 
-    def create_ticket(self, title: str, description: str, priority: int) -> dict:
+    def create_ticket(self, title: str, description: str, priority: int, caller: User) -> dict:
         ticket_id = f"INC{secrets.randbelow(9_000_000) + 1_000_000:07d}"
         ticket = {
+            "requester": caller.username,  # from the token: the model can't open tickets in someone else's name
             "title": title,
             "description": description,
             "status": "New",
@@ -129,14 +145,17 @@ class ServiceDesk:
         self.store.create_item({"id": ticket_id, "type": "ticket", **ticket})
         return {"ticket_id": ticket_id, **ticket}
 
-    def reset_password(self, account: str) -> dict | None:
+    def reset_password(self, account: str, caller: User) -> dict:
+        """Your own password; Service Desk agents may reset anyone's."""
         account = account.strip().lower()
-        person = ACCOUNTS.get(account)
+        if account != caller.username and not caller.is_agent:
+            raise PermissionError("You can only reset your own password. Ask the Service Desk to reset someone else's.")
+        person = ACCOUNTS.get(account) or ({"name": caller.name, "phone_ends_in": "00"} if account == caller.username else None)
         if not person:
-            return None
+            raise LookupError(f"No Contoso account {account} found.")
         reset_at = datetime.now(UTC).isoformat(timespec="seconds")
         self.store.create_item({"id": f"reset-{secrets.token_hex(8)}", "type": "password_reset",
-                                "account": account, "reset_at": reset_at})
+                                "account": account, "reset_at": reset_at, "reset_by": caller.username})  # audit trail
         return {
             "account": account,
             "name": person["name"],

@@ -8,8 +8,13 @@ encoding = tiktoken.get_encoding("o200k_base")
 PER_MESSAGE_OVERHEAD = 4  # role and separators the chat format adds around each message
 
 
+class NotYours(Exception):
+    """The session belongs to someone else (or to nobody: sessions from before sign-in existed)."""
+
+
 class SessionStore:
-    """One Cosmos DB document per conversation: {"id": <session id>, "messages": [...]}.
+    """One Cosmos DB document per conversation:
+    {"id": <session id>, "owner": <user id>, "messages": [...], "pending": <turn waiting for approval> | null}
 
     The session id is also the partition key, so every read and write is a cheap point operation.
     """
@@ -18,22 +23,35 @@ class SessionStore:
         database = CosmosClient(endpoint, credential=credential).get_database_client("helpdesk")
         self.container = database.get_container_client("sessions")
 
-    def history(self, session_id: str) -> list[dict]:
+    def load(self, session_id: str, owner: str) -> dict:
+        """The session, or a new empty one. Raises NotYours if another user owns it."""
         try:
-            return self.container.read_item(item=session_id, partition_key=session_id)["messages"]
+            doc = self.container.read_item(item=session_id, partition_key=session_id)
         except exceptions.CosmosResourceNotFoundError:
-            return []  # a new conversation
+            return {"id": session_id, "owner": owner, "messages": [], "pending": None}  # a new conversation
+        if doc.get("owner") != owner:
+            raise NotYours(session_id)
+        return doc
 
-    def append(self, session_id: str, *messages: dict) -> None:
+    def _update(self, session_id: str, owner: str, operations: list[dict], new_doc: dict) -> None:
         try:
-            # Patch appends on the server: two requests to the same session can't overwrite each other.
+            # Patch changes the document on the server: two requests to the same session can't overwrite
+            # each other's messages. The filter makes Cosmos DB itself refuse to change someone else's session.
             self.container.patch_item(
                 item=session_id,
                 partition_key=session_id,
-                patch_operations=[{"op": "add", "path": "/messages/-", "value": m} for m in messages],
+                patch_operations=operations,
+                filter_predicate=f"FROM c WHERE c.owner = '{owner}'",  # owner is the id from a verified token
             )
         except exceptions.CosmosResourceNotFoundError:
-            self.container.create_item({"id": session_id, "messages": list(messages)})
+            self.container.create_item({"id": session_id, "owner": owner, "messages": [], "pending": None} | new_doc)
+
+    def append(self, session_id: str, owner: str, *messages: dict) -> None:
+        self._update(session_id, owner, [{"op": "add", "path": "/messages/-", "value": m} for m in messages],
+                     {"messages": list(messages)})
+
+    def set_pending(self, session_id: str, owner: str, pending: dict | None) -> None:
+        self._update(session_id, owner, [{"op": "set", "path": "/pending", "value": pending}], {"pending": pending})
 
 
 def count_tokens(message: dict) -> int:

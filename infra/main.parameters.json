@@ -6,6 +6,7 @@
     "location": { "value": "${AZURE_LOCATION}" },
     "principalId": { "value": "${AZURE_PRINCIPAL_ID}" },
     "searchLocation": { "value": "${AZURE_SEARCH_LOCATION}" },
-    "apiExists": { "value": "${SERVICE_API_RESOURCE_EXISTS=false}" }
+    "apiExists": { "value": "${SERVICE_API_RESOURCE_EXISTS=false}" },
+    "apiClientId": { "value": "${AZURE_API_CLIENT_ID}" }
   }
 }

@@ -1,21 +1,23 @@
 import asyncio
+import dataclasses
 import logging
 import re
 from collections.abc import AsyncIterator
 from typing import Literal
 from uuid import UUID, uuid4
 
-from agent_framework import Message
+from agent_framework import AgentResponse, AgentSession, Content, Message
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from openai import AsyncOpenAI, OpenAI
 from pydantic import BaseModel, Field
 
 from app.agent import Toolbox, build_agent
+from app.auth import User, current_user
 from app.backend import ServiceDesk
 from app.config import load_settings
-from app.memory import SessionStore, trim_to_budget
+from app.memory import NotYours, SessionStore, trim_to_budget
 from app.prompts import load_prompt
 from app.search import MIN_RERANKER_SCORE, Passage, PolicySearch
 
@@ -58,6 +60,11 @@ class ChatRequest(BaseModel):
     )
 
 
+class ApprovalRequest(BaseModel):
+    session_id: UUID
+    decisions: dict[str, bool] = Field(description="For each pending action's approval_id: true to approve, false to reject.")
+
+
 # The shape the model must return. The service sends this schema, field descriptions included,
 # to the model, so they're part of the prompt. (A docstring would be sent too, hence a comment.)
 class HelpdeskAnswer(BaseModel):
@@ -83,6 +90,7 @@ class ToolCall(BaseModel):
 
 
 class ChatResponse(HelpdeskAnswer):
+    status: Literal["answered"] = "answered"
     prompt: str  # which prompt file produced this answer
     session_id: UUID
     history_sent: int  # earlier messages the model saw; older ones were trimmed to fit the token budget
@@ -90,18 +98,34 @@ class ChatResponse(HelpdeskAnswer):
     citations: list[Citation]
 
 
-def load_turn(request: ChatRequest) -> tuple[str, list[Message]]:
-    """Returns the session id and the conversation to send: trimmed history plus the new question."""
-    session_id = str(request.session_id or uuid4())
-    history = trim_to_budget(sessions.history(session_id), settings.history_token_budget)
-    messages = [Message(m["role"], [m["content"]]) for m in history]
-    return session_id, [*messages, Message("user", [request.question])]
+class PendingAction(BaseModel):
+    approval_id: str
+    tool: str
+    arguments: dict  # exactly what will run if approved
 
 
-def save_turn(session_id: str, question: str, answer: str) -> None:
-    # Only the question and the final answer are kept. Tool results are a snapshot (a ticket's status
-    # changes), so later turns look them up again instead of trusting an old copy.
-    sessions.append(session_id, {"role": "user", "content": question}, {"role": "assistant", "content": answer})
+class ApprovalRequired(BaseModel):
+    status: Literal["approval_required"] = "approval_required"
+    session_id: UUID
+    actions: list[PendingAction]  # approve or reject each with POST /chat/approve
+    tool_calls: list[ToolCall]  # what already ran: lookups don't need approval
+
+
+def load_session(session_id: UUID | None, user: User) -> dict:
+    try:
+        return sessions.load(str(session_id or uuid4()), user.id)
+    except NotYours:
+        raise HTTPException(404, "No such session") from None  # someone else's session looks like no session
+
+
+def start_turn(doc: dict, question: str, user: User) -> list[Message]:
+    """Who's asking, the trimmed history and the new question: the conversation sent to the model."""
+    if doc.get("pending"):
+        raise HTTPException(409, "An action is waiting for approval: approve or reject it with POST /chat/approve")
+    history = trim_to_budget(doc["messages"], settings.history_token_budget)
+    who = (f"Signed-in user: {user.name}. Their account: {user.username}. "
+           f"Service Desk agent: {'yes' if user.is_agent else 'no'}.")
+    return [Message("system", [who]), *[Message(m["role"], [m["content"]]) for m in history], Message("user", [question])]
 
 
 def citations(answer: str, passages: list[Passage]) -> list[Citation]:
@@ -114,44 +138,114 @@ def citations(answer: str, passages: list[Passage]) -> list[Citation]:
     return cited
 
 
+def pending_actions(response: AgentResponse) -> list[PendingAction]:
+    return [
+        PendingAction(approval_id=r.id, tool=r.function_call.name, arguments=r.function_call.parse_arguments() or {})
+        for r in response.user_input_requests
+    ]
+
+
+async def park_turn(doc: dict, user: User, question: str, session: AgentSession, toolbox: Toolbox,
+                    response: AgentResponse) -> None:
+    """The agent stopped to ask for approval. Keep the turn in Cosmos DB until the user decides, possibly
+    minutes later and on another replica: the framework's session (with the pending request), the question,
+    and the passages found so far (for citations)."""
+    pending = {
+        "question": question,
+        "session": session.to_dict(),
+        "requests": [r.to_dict() for r in response.user_input_requests],
+        "passages": [dataclasses.asdict(p) for p in toolbox.passages],
+        "history_sent": len(doc["messages"]),
+    }
+    await asyncio.to_thread(sessions.set_pending, doc["id"], user.id, pending)
+
+
+async def finish_turn(doc: dict, user: User, question: str, answer: str) -> None:
+    # Only the question and the final answer are kept. Tool results are a snapshot (a ticket's status
+    # changes), so later turns look them up again instead of trusting an old copy.
+    await asyncio.to_thread(sessions.append, doc["id"], user.id,
+                            {"role": "user", "content": question}, {"role": "assistant", "content": answer})
+    if doc.get("pending"):
+        await asyncio.to_thread(sessions.set_pending, doc["id"], user.id, None)
+
+
+async def answer_or_park(doc: dict, user: User, question: str, session: AgentSession, toolbox: Toolbox,
+                         response: AgentResponse, history_sent: int) -> ChatResponse | ApprovalRequired:
+    if response.user_input_requests:
+        await park_turn(doc, user, question, session, toolbox, response)
+        return ApprovalRequired(session_id=doc["id"], actions=pending_actions(response), tool_calls=toolbox.calls)
+    parsed = response.value
+    if parsed is None:  # the model refused, or ran out of tokens mid-JSON
+        raise HTTPException(status_code=502, detail="Model did not return a valid answer")
+    await finish_turn(doc, user, question, parsed.answer)
+    return ChatResponse(
+        **parsed.model_dump(),
+        prompt=prompt.name,
+        session_id=doc["id"],
+        history_sent=history_sent,
+        tool_calls=toolbox.calls,
+        citations=citations(parsed.answer, toolbox.passages),
+    )
+
+
 @app.get("/healthz")
 def healthz() -> dict:
     return {"status": "ok"}
 
 
 @app.post("/chat")
-async def chat(request: ChatRequest) -> ChatResponse:
-    """For other systems: a typed answer they can route on, guaranteed to match the schema."""
-    session_id, messages = await asyncio.to_thread(load_turn, request)  # Cosmos DB client is synchronous
-    toolbox = Toolbox(policies, desk)
+async def chat(request: ChatRequest, user: User = Depends(current_user)) -> ChatResponse | ApprovalRequired:
+    """For other systems: a typed answer they can route on, or the actions waiting for the user's approval."""
+    doc = await asyncio.to_thread(load_session, request.session_id, user)  # Cosmos DB client is synchronous
+    messages = start_turn(doc, request.question, user)
+    session = agent.create_session()  # the framework's state for this turn; it holds pending approvals
+    toolbox = Toolbox(policies, desk, user)
     response = await agent.run(
         messages,
+        session=session,
         tools=toolbox.tools(),
         middleware=[toolbox.record_tool_call],
         options={"response_format": HelpdeskAnswer, "reasoning_effort": "low"},
     )
-    parsed = response.value
-    if parsed is None:  # the model refused, or ran out of tokens mid-JSON
-        raise HTTPException(status_code=502, detail="Model did not return a valid answer")
-    await asyncio.to_thread(save_turn, session_id, request.question, parsed.answer)
-    return ChatResponse(
-        **parsed.model_dump(),
-        prompt=prompt.name,
-        session_id=session_id,
-        history_sent=len(messages) - 1,
-        tool_calls=toolbox.calls,
-        citations=citations(parsed.answer, toolbox.passages),
+    return await answer_or_park(doc, user, request.question, session, toolbox, response, len(messages) - 2)
+
+
+@app.post("/chat/approve")
+async def approve(request: ApprovalRequest, user: User = Depends(current_user)) -> ChatResponse | ApprovalRequired:
+    """Approve or reject the actions the agent asked to take, and let it finish its answer."""
+    doc = await asyncio.to_thread(load_session, request.session_id, user)
+    pending = doc.get("pending")
+    if not pending:
+        raise HTTPException(409, "Nothing is waiting for approval in this session")
+    requests = [Content.from_dict(r) for r in pending["requests"]]
+    if missing := {r.id for r in requests} - request.decisions.keys():
+        raise HTTPException(400, f"Decide on every pending action; missing: {sorted(missing)}")
+
+    # The framework only accepts these responses for requests its own session issued: a made-up approval for an
+    # action the agent never asked for is ignored.
+    session = AgentSession.from_dict(pending["session"])
+    toolbox = Toolbox(policies, desk, user, passages=[Passage(**p) for p in pending["passages"]])
+    response = await agent.run(
+        [Message("user", [r.to_function_approval_response(request.decisions[r.id]) for r in requests])],
+        session=session,
+        tools=toolbox.tools(),
+        middleware=[toolbox.record_tool_call],
+        options={"response_format": HelpdeskAnswer, "reasoning_effort": "low"},
     )
+    return await answer_or_park(doc, user, pending["question"], session, toolbox, response, pending["history_sent"])
 
 
 @app.post("/chat/stream")
-async def chat_stream(request: ChatRequest) -> StreamingResponse:
+async def chat_stream(request: ChatRequest, user: User = Depends(current_user)) -> StreamingResponse:
     """For people: plain text that appears as it's generated, then the sources it cited."""
-    session_id, messages = await asyncio.to_thread(load_turn, request)
-    toolbox = Toolbox(policies, desk)
+    doc = await asyncio.to_thread(load_session, request.session_id, user)
+    messages = start_turn(doc, request.question, user)
+    session = agent.create_session()
+    toolbox = Toolbox(policies, desk, user)
     stream = agent.run(
         messages,
         stream=True,
+        session=session,
         tools=toolbox.tools(),
         middleware=[toolbox.record_tool_call],
         options={"reasoning_effort": "minimal"},  # reasoning happens before the first token; keep it short for people
@@ -161,27 +255,35 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
         async for update in stream:
             if update.text:
                 yield update.text
-        answer = (await stream.get_final_response()).text
-        if cited := citations(answer, toolbox.passages):
+        response = await stream.get_final_response()
+        if response.user_input_requests:
+            await park_turn(doc, user, request.question, session, toolbox, response)
+            yield "\n\nWaiting for your approval (POST /chat/approve):\n" + "".join(
+                f"- {a.approval_id}: {a.tool}({a.arguments})\n" for a in pending_actions(response)
+            )
+            return
+        if cited := citations(response.text, toolbox.passages):
             yield "\n\nSources:\n" + "".join(f"[{c.number}] {c.title} ({c.policy_id}), {c.section}\n" for c in cited)
         # Saved only once the whole answer has been sent; a dropped connection leaves no half answer.
-        await asyncio.to_thread(save_turn, session_id, request.question, answer)
+        await finish_turn(doc, user, request.question, response.text)
 
-    headers = {"X-Session-Id": session_id, "X-History-Sent": str(len(messages) - 1)}
+    headers = {"X-Session-Id": doc["id"], "X-History-Sent": str(len(messages) - 2)}
     return StreamingResponse(tokens(), media_type="text/plain; charset=utf-8", headers=headers)
 
 
 @app.get("/sessions/{session_id}")
-def get_session(session_id: UUID) -> dict:
-    """The full stored conversation, including messages trimmed from what the model sees."""
-    messages = sessions.history(str(session_id))
-    if not messages:
+def get_session(session_id: UUID, user: User = Depends(current_user)) -> dict:
+    """Your stored conversation, including messages trimmed from what the model sees."""
+    doc = load_session(session_id, user)
+    if not doc["messages"] and not doc.get("pending"):
         raise HTTPException(status_code=404, detail="No such session")
-    return {"session_id": session_id, "messages": messages}
+    waiting = [{"tool": r["function_call"]["name"], "arguments": r["function_call"]["arguments"]}
+               for r in (doc.get("pending") or {}).get("requests", [])]
+    return {"session_id": session_id, "messages": doc["messages"], "waiting_for_approval": waiting}
 
 
 @app.get("/search")
-def search(q: str) -> list[dict]:
+def search(q: str, user: User = Depends(current_user)) -> list[dict]:
     """What retrieval finds for a query, including passages below the score cut-off. For seeing how search behaves."""
     return [
         {"score": round(p.score, 2), "sent": p.score >= MIN_RERANKER_SCORE, "policy_id": p.policy_id, "section": p.section}
