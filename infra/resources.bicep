@@ -23,6 +23,7 @@ var monitoringPublisherRole = '3913510d-42f4-4e42-8a64-420c390055eb' // Monitori
 var cosmosDataContributorRole = '00000000-0000-0000-0000-000000000002' // Cosmos DB Built-in Data Contributor (data plane)
 var searchIndexReaderRole = '1407120a-92aa-4202-b7e9-c0e197c71c8f' // Search Index Data Reader: query only
 var searchIndexContributorRole = '8ebe5a00-799e-43f5-93ac-243d3dce84a7' // Search Index Data Contributor: load documents
+var azureAiUserRole = '53ca6127-db72-4b80-b1b0-d745d6d5456d' // Azure AI User: use a Foundry project
 var searchServiceContributorRole = '7ca78c08-252a-4471-8644-bb5ff32d4ba0' // Search Service Contributor: create indexes
 
 // ---------- Identity: the app's own Entra ID identity, no secrets to manage ----------
@@ -196,6 +197,18 @@ resource servicedeskContainer 'Microsoft.DocumentDB/databaseAccounts/sqlDatabase
   }
 }
 
+// What users say about answers (v12). No expiry: a bad answer has to stay readable until someone triages it.
+resource feedbackContainer 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers@2024-11-15' = {
+  parent: cosmosDb
+  name: 'feedback'
+  properties: {
+    resource: {
+      id: 'feedback'
+      partitionKey: { paths: ['/id'], kind: 'Hash' }
+    }
+  }
+}
+
 // Cosmos DB data access uses its own role system, not Azure RBAC. Scoped to the database, not the account.
 resource appCosmosAccess 'Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments@2024-11-15' = {
   parent: cosmos
@@ -333,6 +346,46 @@ resource ciCosmosAccess 'Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignment
     scope: '${cosmos.id}/dbs/${cosmosDb.name}'
   }
 }
+
+// ---------- Azure AI Foundry: a project for the AI Red Teaming Agent (v12) ----------
+// The red team's attack prompts come from Microsoft's safety service, and so does the scoring of the answers; both
+// need a Foundry project. Results are uploaded to it, to the project's red teaming page. Nothing is billed while idle.
+
+resource foundry 'Microsoft.CognitiveServices/accounts@2025-06-01' = {
+  name: 'aif-${token}'
+  location: location
+  tags: tags
+  kind: 'AIServices'
+  sku: { name: 'S0' }
+  identity: { type: 'SystemAssigned' }
+  properties: {
+    customSubDomainName: 'aif-${token}'
+    allowProjectManagement: true // Foundry projects live inside this account
+    disableLocalAuth: true
+    publicNetworkAccess: 'Enabled'
+  }
+}
+
+resource foundryProject 'Microsoft.CognitiveServices/accounts/projects@2025-06-01' = {
+  parent: foundry
+  name: 'helpdesk'
+  location: location
+  identity: { type: 'SystemAssigned' }
+  properties: { displayName: 'Contoso Helpdesk' }
+}
+
+// You and CI run the red team; the app never does.
+resource foundryAccess 'Microsoft.Authorization/roleAssignments@2022-04-01' = [
+  for who in filter([{ id: principalId, type: 'User' }, { id: ciPrincipalId, type: 'ServicePrincipal' }], w => !empty(w.id)): {
+    name: guid(foundry.id, who.id, azureAiUserRole)
+    scope: foundry
+    properties: {
+      principalId: who.id
+      principalType: who.type
+      roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', azureAiUserRole)
+    }
+  }
+]
 
 // ---------- Container registry: the app pulls its image with its identity ----------
 
@@ -474,4 +527,5 @@ output searchEndpoint string = 'https://${search.name}.search.windows.net'
 output contentSafetyEndpoint string = contentSafety.properties.endpoint
 output appInsightsConnectionString string = appInsights.properties.ConnectionString
 output gatewayEndpoint string = gateway.outputs.endpoint
+output foundryProjectEndpoint string = 'https://${foundry.properties.customSubDomainName}.services.ai.azure.com/api/projects/${foundryProject.name}'
 output apiUri string = 'https://${api.properties.configuration.ingress.fqdn}'

@@ -17,7 +17,7 @@ Each iteration has its own write-up in [`docs/iterations/`](docs/iterations/) co
 
 ## Getting started
 
-**Current iteration: [v11: Resilience and cost control](docs/iterations/v11.md)**
+**Current iteration: [v12: Continuous improvement](docs/iterations/v12.md)**
 
 You need the [Azure Developer CLI](https://learn.microsoft.com/azure/developer/azure-developer-cli/install-azd) (`azd`), the [Azure CLI](https://learn.microsoft.com/cli/azure/install-azure-cli) (`az`), Python 3, an Azure subscription where you can create role assignments (Owner or User Access Administrator), and permission to create app registrations in its Entra ID tenant.
 
@@ -51,6 +51,10 @@ curl -X POST $URL/chat -H "$AUTH" -H 'Content-Type: application/json' \
 curl -X POST $URL/chat/approve -H "$AUTH" -H 'Content-Type: application/json' \
   -d '{"session_id": "<session_id>", "decisions": {"<approval_id>": true}}'
 
+# Was an answer wrong? Say so, with the answer's trace_id (/chat/stream returns it in X-Trace-Id)
+curl -X POST $URL/feedback -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"session_id": "<session_id>", "trace_id": "<trace_id>", "helpful": false, "comment": "What was wrong"}'
+
 # Continue a conversation: send back the session_id (/chat/stream returns it in the X-Session-Id header)
 curl $URL/sessions/<session_id> -H "$AUTH"    # your stored conversation
 
@@ -70,7 +74,7 @@ Messages and the text tools return are checked with Azure AI Content Safety: pro
 
 Every response includes `usage` (tokens and estimated cost) and a `trace_id`. Each request is traced in Application Insights: model calls with token counts, tools, searches, safety checks. See [v9](docs/iterations/v9.md) for queries.
 
-Evaluations check the agent against a golden dataset of 19 cases (answers, permissions, approvals, attacks), with deterministic checks and LLM judges. Run them with the azd values exported:
+Evaluations check the agent against a golden dataset of 20 cases (answers, permissions, approvals, attacks), with deterministic checks and LLM judges. Run them with the azd values exported:
 
 ```bash
 pip install -r evals/requirements.txt
@@ -79,13 +83,15 @@ python -m evals.run          # about 4 minutes; exit code 1 if the gate fails
 
 GitHub Actions runs them on pull requests once `python -m scripts.setup_ci <owner>/<repo>` has set up access. See [v10](docs/iterations/v10.md).
 
+Bad answers and attacks become eval cases. `python -m evals.from_feedback` drafts cases from thumbs-down feedback, and `evals/red_team.py` runs Microsoft's AI Red Teaming Agent against the agent (weekly in GitHub Actions; locally it needs Python 3.13, e.g. `uv venv -p 3.13 .venv-redteam`). Both write drafts to `evals/candidates.yaml`. Review them, check they fail with `python -m evals.run --dataset evals/candidates.yaml`, and move them into `golden.yaml`. See [v12](docs/iterations/v12.md).
+
 The app doesn't call Azure OpenAI directly: every model call goes through an AI gateway (Azure API Management) that limits each user to `GATEWAY_TOKENS_PER_MINUTE` tokens a minute (default 10000) and fails over to a second Azure OpenAI region (`AZURE_OPENAI_SECONDARY_LOCATION`, default `swedencentral`) when the first throttles or fails. In the app, a question gets at most `TURN_TIMEOUT_SECONDS` (default 60) and a conversation at most `SESSION_TOKEN_BUDGET` tokens (default 100000). Over a limit, you get a 429 or 504 that says when to try again. See it with `python -m scripts.burst 10`, and read [v11](docs/iterations/v11.md).
 
 After changing a policy, update the index without redeploying (with the azd values exported as above): `python -m scripts.ingest`.
 
 Conversations are stored in Cosmos DB for 7 days after their last message. Only the newest messages that fit in `HISTORY_TOKEN_BUDGET` tokens (default 2000) are sent to the model.
 
-The system prompt lives in [`prompts/`](prompts/). Set `PROMPT_NAME` to use a different prompt file (default `helpdesk-v7`).
+The system prompt lives in [`prompts/`](prompts/). Set `PROMPT_NAME` to use a different prompt file (default `helpdesk-v8`).
 
 To run the API locally against the same Azure resources (it uses your `azd`/`az` login, no keys):
 
@@ -117,5 +123,5 @@ azd down --purge
 | v8 | [Safety: Prompt Shields for direct and indirect injection, groundedness](docs/iterations/v8.md) | ✅ done |
 | v9 | [Observability: tracing, tokens and cost per request](docs/iterations/v9.md) | ✅ done |
 | v10 | [Evaluations as a CI gate](docs/iterations/v10.md) | ✅ done |
-| v11 | [Resilience and cost control: AI gateway, per-user limits, failover, budgets](docs/iterations/v11.md) | ✅ current |
-| v12 | Continuous improvement: feedback loop, red teaming | planned |
+| v11 | [Resilience and cost control: AI gateway, per-user limits, failover, budgets](docs/iterations/v11.md) | ✅ done |
+| v12 | [Continuous improvement: feedback loop, red teaming](docs/iterations/v12.md) | ✅ current |

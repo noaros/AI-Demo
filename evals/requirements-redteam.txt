@@ -1,0 +1,2 @@
+azure-ai-evaluation[redteam]>=1.18  # PyRIT: needs Python 3.13 or older
+pyyaml>=6

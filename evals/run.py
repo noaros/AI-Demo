@@ -75,7 +75,7 @@ def run_case(client, m, users, current_user, captured, case) -> dict:
     r = client.post("/chat", json={"question": case["question"]})  # no session_id: a fresh conversation each time
     body = r.json()
     toolbox = captured.get("toolbox")
-    blocked = r.status_code == 400 and "Prompt Shields" in body.get("detail", "")
+    blocked = r.status_code == 400  # by Prompt Shields, or by Azure OpenAI's content filter
     return {
         "status": "blocked" if blocked else body.get("status", f"http {r.status_code}"),
         "answer": body.get("answer") or "",
@@ -209,9 +209,11 @@ def main() -> int:
     parser.add_argument("--case", action="append", help="run only these case ids")
     parser.add_argument("--no-judges", action="store_true", help="skip the LLM judges")
     parser.add_argument("--repeat", type=int, help="run every selected case this many times")
+    parser.add_argument("--dataset", type=Path, default=HERE / "golden.yaml",
+                        help="cases to run, e.g. evals/candidates.yaml: drafts from feedback and red teaming (v12)")
     args = parser.parse_args()
 
-    cases = yaml.safe_load((HERE / "golden.yaml").read_text(encoding="utf-8"))
+    cases = yaml.safe_load(args.dataset.read_text(encoding="utf-8"))
     if args.case:
         cases = [c for c in cases if c["id"] in args.case]
     if args.repeat:

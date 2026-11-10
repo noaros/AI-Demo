@@ -52,8 +52,9 @@ def main(repo: str) -> None:
     for key in ["AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_DEPLOYMENT", "AZURE_OPENAI_EMBEDDING_DEPLOYMENT",
                 "AZURE_OPENAI_JUDGE_DEPLOYMENT",
                 "AZURE_SEARCH_ENDPOINT", "AZURE_COSMOS_ENDPOINT", "CONTENT_SAFETY_ENDPOINT",
-                "AUTH_TENANT_ID", "AUTH_CLIENT_ID"]:
-        variables[key] = os.environ[key]
+                "AUTH_TENANT_ID", "AUTH_CLIENT_ID", "AZURE_AI_PROJECT_ENDPOINT"]:
+        if key in os.environ:  # AZURE_AI_PROJECT_ENDPOINT (red teaming, v12) exists once provisioned
+            variables[key] = os.environ[key]
     for key, value in variables.items():
         print(f"  {key}={value}")
 

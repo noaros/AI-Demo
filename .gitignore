@@ -1,5 +1,7 @@
 .azure/
 .env
-.venv/
+.venv*/
 __pycache__/
 evals/results/
+# drafts from feedback and red teaming: may hold users' questions and answers
+evals/candidates.yaml

@@ -11,7 +11,7 @@ from uuid import UUID, uuid4
 
 import openai
 from agent_framework import AgentResponse, AgentSession, Content, Message
-from agent_framework.exceptions import ChatClientException
+from agent_framework.exceptions import ChatClientContentFilterException, ChatClientException
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -23,6 +23,7 @@ from app.agent import Toolbox, build_agent
 from app.auth import User, current_user
 from app.backend import ServiceDesk
 from app.config import load_settings
+from app.feedback import FeedbackStore
 from app.memory import NotYours, SessionStore, trim_to_budget
 from app.prompts import load_prompt
 from app.safety import ContentSafety
@@ -79,6 +80,7 @@ openai_base_url = f"{settings.ai_gateway_endpoint or settings.openai_endpoint}/o
 MODEL_CALL_TIMEOUT = 30
 sessions = SessionStore(settings.cosmos_endpoint, credential)
 desk = ServiceDesk(settings.cosmos_endpoint, credential)
+feedback = FeedbackStore(settings.cosmos_endpoint, credential)
 policies = PolicySearch(
     settings.search_endpoint, credential,
     OpenAI(base_url=openai_base_url, api_key=token_provider, timeout=MODEL_CALL_TIMEOUT,
@@ -102,12 +104,20 @@ async def remember_request_span(request, call_next):
     return await call_next(request)
 
 
+REFUSAL_CODES = {"content_filter", "bio_policy"}
+
+
 @app.exception_handler(ChatClientException)
 async def model_unavailable(request, exc: ChatClientException) -> JSONResponse:
     """The model couldn't be reached, even after retries and failover. Say so plainly, and when to try again."""
     cause = exc.__cause__
     logging.getLogger("agent").warning("model call failed: %r", cause)
     status = cause.status_code if isinstance(cause, openai.APIStatusError) else None
+    # Azure OpenAI's own content filters refused the request: that's an answer, not an outage. The red team (v12)
+    # found these reported as "model unavailable". Not all of them say content_filter: bio_policy is one that doesn't.
+    if isinstance(exc, ChatClientContentFilterException) or getattr(cause, "code", None) in REFUSAL_CODES:
+        annotate(blocked="content_filter")
+        return error(400, "Blocked by the content filter: this request can't be answered")
     if status in (429, 503):  # 429: this user is over their limit; 503: every region is busy (the gateway's pool)
         retry_after = seconds_until(cause.response.headers.get("retry-after"))
         annotate(blocked="rate_limited" if status == 429 else "no_capacity")
@@ -142,6 +152,13 @@ class ChatRequest(BaseModel):
     session_id: UUID | None = Field(
         default=None, description="Omit to start a conversation; send the returned one back to continue it."
     )
+
+
+class FeedbackRequest(BaseModel):
+    session_id: UUID
+    trace_id: str = Field(description="The answer's trace_id, from the response (or X-Trace-Id when streaming).")
+    helpful: bool
+    comment: str = Field(default="", max_length=2000, description="What was wrong, or what you expected.")
 
 
 class ApprovalRequest(BaseModel):
@@ -325,11 +342,12 @@ async def park_turn(doc: dict, user: User, question: str, session: AgentSession,
     await asyncio.to_thread(sessions.set_pending, doc["id"], user.id, pending)
 
 
-async def finish_turn(doc: dict, user: User, question: str, answer: str) -> None:
+async def finish_turn(doc: dict, user: User, question: str, answer: str, trace_id: str) -> None:
     # Only the question and the final answer are kept. Tool results are a snapshot (a ticket's status
-    # changes), so later turns look them up again instead of trusting an old copy.
-    await asyncio.to_thread(sessions.append, doc["id"], user.id,
-                            {"role": "user", "content": question}, {"role": "assistant", "content": answer})
+    # changes), so later turns look them up again instead of trusting an old copy. The answer keeps its trace id:
+    # feedback on it can be linked to the trace, and the trace to the answer.
+    await asyncio.to_thread(sessions.append, doc["id"], user.id, {"role": "user", "content": question},
+                            {"role": "assistant", "content": answer, "trace_id": trace_id})
     if doc.get("pending"):
         await asyncio.to_thread(sessions.set_pending, doc["id"], user.id, None)
 
@@ -347,7 +365,7 @@ async def answer_or_park(doc: dict, user: User, question: str, session: AgentSes
     parsed = response.value
     if parsed is None:  # the model refused, or ran out of tokens mid-JSON
         raise HTTPException(status_code=502, detail="Model did not return a valid answer")
-    await finish_turn(doc, user, question, parsed.answer)
+    await finish_turn(doc, user, question, parsed.answer, current_trace_id())
     await charge(doc, user, usage)
     record_turn(user, doc["id"], "answered", usage, toolbox)
     return ChatResponse(
@@ -449,10 +467,28 @@ async def chat_stream(request: ChatRequest, user: User = Depends(current_user)) 
         if cited := citations(response.text, toolbox.passages):
             yield "\n\nSources:\n" + "".join(f"[{c.number}] {c.title} ({c.policy_id}), {c.section}\n" for c in cited)
         # Saved only once the whole answer has been sent; a dropped connection leaves no half answer.
-        await finish_turn(doc, user, request.question, response.text)
+        await finish_turn(doc, user, request.question, response.text, trace_id)
 
-    headers = {"X-Session-Id": doc["id"], "X-History-Sent": str(len(messages) - 2), "X-Trace-Id": current_trace_id()}
+    trace_id = current_trace_id()
+    headers = {"X-Session-Id": doc["id"], "X-History-Sent": str(len(messages) - 2), "X-Trace-Id": trace_id}
     return StreamingResponse(tokens(), media_type="text/plain; charset=utf-8", headers=headers)
+
+
+@app.post("/feedback", status_code=204)
+async def give_feedback(request: FeedbackRequest, user: User = Depends(current_user)) -> None:
+    """Thumbs up or down on an answer you got. Thumbs down, with a comment, is how bad answers become eval cases."""
+    doc = await asyncio.to_thread(load_session, request.session_id, user)  # your own sessions only
+    turn = next((i for i, m in enumerate(doc["messages"]) if m.get("trace_id") == request.trace_id), None)
+    if turn is None or turn == 0:
+        raise HTTPException(404, "No such answer in this session")
+    await asyncio.to_thread(
+        feedback.save, request.trace_id, session_id=doc["id"], user_id=user.id, is_agent=user.is_agent,
+        helpful=request.helpful, comment=request.comment, prompt=prompt.name,
+        question=doc["messages"][turn - 1]["content"], answer=doc["messages"][turn]["content"],
+    )
+    # On this request's trace too, pointing at the answer's: Application Insights can join them.
+    annotate(feedback_for=request.trace_id, helpful=request.helpful)
+    logging.getLogger("agent").info("feedback: %s on %s", "helpful" if request.helpful else "not helpful", request.trace_id)
 
 
 @app.get("/sessions/{session_id}")

@@ -31,7 +31,7 @@ def load_settings() -> Settings:
         # Model calls go through the AI gateway when there is one (v11); otherwise straight to Azure OpenAI.
         ai_gateway_endpoint=(os.environ.get("AI_GATEWAY_ENDPOINT") or "").rstrip("/") or None,
         openai_deployment=os.environ["AZURE_OPENAI_DEPLOYMENT"],
-        prompt_name=os.environ.get("PROMPT_NAME", "helpdesk-v7"),
+        prompt_name=os.environ.get("PROMPT_NAME", "helpdesk-v8"),
         cosmos_endpoint=os.environ["AZURE_COSMOS_ENDPOINT"],
         embedding_deployment=os.environ["AZURE_OPENAI_EMBEDDING_DEPLOYMENT"],
         search_endpoint=os.environ["AZURE_SEARCH_ENDPOINT"],
