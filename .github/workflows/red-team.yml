@@ -7,6 +7,12 @@ on:
     - cron: "0 6 * * 1" # Mondays 06:00 UTC
   workflow_dispatch:
 
+# Evals and the red team share the agent's model deployment (10,000 tokens/min): run one at a time, or both get
+# throttled and the evals fail for the wrong reason. A second run waits instead.
+concurrency:
+  group: agent-model-quota
+  cancel-in-progress: false
+
 permissions:
   id-token: write
   contents: read
