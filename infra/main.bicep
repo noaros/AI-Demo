@@ -24,6 +24,9 @@ param apiClientId string
 @description('Region for Content Safety, if different: groundedness detection is only offered in some regions.')
 param contentSafetyLocation string = ''
 
+@description('Service principal GitHub Actions signs in as to run the evaluations. Set by scripts/setup_ci.py.')
+param ciPrincipalId string = ''
+
 param openAiModelName string = 'gpt-5-mini'
 param openAiModelVersion string = '2025-08-07'
 param embeddingModelName string = 'text-embedding-3-small'
@@ -48,6 +51,7 @@ module resources 'resources.bicep' = {
     apiExists: apiExists
     apiClientId: apiClientId
     contentSafetyLocation: empty(contentSafetyLocation) ? location : contentSafetyLocation
+    ciPrincipalId: ciPrincipalId
     openAiModelName: openAiModelName
     openAiModelVersion: openAiModelVersion
     embeddingModelName: embeddingModelName
@@ -61,6 +65,7 @@ output AZURE_OPENAI_ENDPOINT string = resources.outputs.openAiEndpoint
 output AZURE_OPENAI_DEPLOYMENT string = resources.outputs.openAiDeployment
 output AZURE_COSMOS_ENDPOINT string = resources.outputs.cosmosEndpoint
 output AZURE_OPENAI_EMBEDDING_DEPLOYMENT string = resources.outputs.embeddingDeployment
+output AZURE_OPENAI_JUDGE_DEPLOYMENT string = resources.outputs.judgeDeployment
 output AZURE_SEARCH_ENDPOINT string = resources.outputs.searchEndpoint
 output AUTH_TENANT_ID string = tenant().tenantId
 output AUTH_CLIENT_ID string = apiClientId

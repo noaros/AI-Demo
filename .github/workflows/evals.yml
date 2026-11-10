@@ -1,0 +1,46 @@
+# Runs the evaluations (evals/golden.yaml) on every pull request that could change how the agent behaves,
+# against the Azure environment set up with scripts/setup_ci.py. A failing gate fails the check.
+name: Evaluations
+
+on:
+  pull_request:
+    paths: [app/**, prompts/**, data/**, evals/**, requirements.txt]
+  workflow_dispatch:
+
+permissions:
+  id-token: write # lets the job ask GitHub for an OIDC token, which Entra ID exchanges for an Azure token
+  contents: read
+
+jobs:
+  evals:
+    runs-on: ubuntu-latest
+    if: vars.AZURE_CLIENT_ID != '' # skipped until CI access is set up
+    timeout-minutes: 30
+    env:
+      AZURE_OPENAI_ENDPOINT: ${{ vars.AZURE_OPENAI_ENDPOINT }}
+      AZURE_OPENAI_DEPLOYMENT: ${{ vars.AZURE_OPENAI_DEPLOYMENT }}
+      AZURE_OPENAI_EMBEDDING_DEPLOYMENT: ${{ vars.AZURE_OPENAI_EMBEDDING_DEPLOYMENT }}
+      AZURE_OPENAI_JUDGE_DEPLOYMENT: ${{ vars.AZURE_OPENAI_JUDGE_DEPLOYMENT }}
+      AZURE_SEARCH_ENDPOINT: ${{ vars.AZURE_SEARCH_ENDPOINT }}
+      AZURE_COSMOS_ENDPOINT: ${{ vars.AZURE_COSMOS_ENDPOINT }}
+      CONTENT_SAFETY_ENDPOINT: ${{ vars.CONTENT_SAFETY_ENDPOINT }}
+      AUTH_TENANT_ID: ${{ vars.AUTH_TENANT_ID }}
+      AUTH_CLIENT_ID: ${{ vars.AUTH_CLIENT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements.txt -r evals/requirements.txt
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true # the CI identity has data access only, no subscription role
+      - run: python -m evals.run
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: eval-results
+          path: evals/results/

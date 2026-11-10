@@ -5,6 +5,7 @@ param searchLocation string
 param apiExists bool
 param apiClientId string
 param contentSafetyLocation string
+param ciPrincipalId string
 param openAiModelName string
 param openAiModelVersion string
 param embeddingModelName string
@@ -63,6 +64,18 @@ resource embeddingDeployment 'Microsoft.CognitiveServices/accounts/deployments@2
   sku: { name: 'GlobalStandard', capacity: 50 }
   properties: {
     model: { format: 'OpenAI', name: embeddingModelName, version: embeddingModelVersion }
+  }
+}
+
+// For the evaluations' LLM judges: the same model, with its own quota. Judges sharing the app's deployment
+// would throttle real users while evals run (they did: 429 "exceeded token rate limit").
+resource judgeDeployment 'Microsoft.CognitiveServices/accounts/deployments@2024-10-01' = {
+  parent: openAi
+  name: 'judge'
+  dependsOn: [embeddingDeployment]
+  sku: { name: 'GlobalStandard', capacity: 100 } // 100,000 tokens per minute; quota is a limit, not a charge
+  properties: {
+    model: { format: 'OpenAI', name: openAiModelName, version: openAiModelVersion }
   }
 }
 
@@ -226,6 +239,50 @@ resource devContentSafetyAccess 'Microsoft.Authorization/roleAssignments@2022-04
   }
 }
 
+// ---------- CI: what GitHub Actions needs to run the evaluations, and nothing more ----------
+// Data access only: call the model, query the index, call Content Safety, write eval conversations.
+// No access to manage or deploy anything.
+
+resource ciOpenAiAccess 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (!empty(ciPrincipalId)) {
+  name: guid(openAi.id, ciPrincipalId, openAiUserRole)
+  scope: openAi
+  properties: {
+    principalId: ciPrincipalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', openAiUserRole)
+  }
+}
+
+resource ciSearchAccess 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (!empty(ciPrincipalId)) {
+  name: guid(search.id, ciPrincipalId, searchIndexReaderRole)
+  scope: search
+  properties: {
+    principalId: ciPrincipalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', searchIndexReaderRole)
+  }
+}
+
+resource ciContentSafetyAccess 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (!empty(ciPrincipalId)) {
+  name: guid(contentSafety.id, ciPrincipalId, cognitiveServicesUserRole)
+  scope: contentSafety
+  properties: {
+    principalId: ciPrincipalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', cognitiveServicesUserRole)
+  }
+}
+
+resource ciCosmosAccess 'Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments@2024-11-15' = if (!empty(ciPrincipalId)) {
+  parent: cosmos
+  name: guid(cosmosDb.id, ciPrincipalId, cosmosDataContributorRole)
+  properties: {
+    principalId: ciPrincipalId
+    roleDefinitionId: '${cosmos.id}/sqlRoleDefinitions/${cosmosDataContributorRole}'
+    scope: '${cosmos.id}/dbs/${cosmosDb.name}'
+  }
+}
+
 // ---------- Container registry: the app pulls its image with its identity ----------
 
 resource registry 'Microsoft.ContainerRegistry/registries@2023-07-01' = {
@@ -360,6 +417,7 @@ output openAiEndpoint string = openAi.properties.endpoint
 output openAiDeployment string = chatDeployment.name
 output cosmosEndpoint string = cosmos.properties.documentEndpoint
 output embeddingDeployment string = embeddingDeployment.name
+output judgeDeployment string = judgeDeployment.name
 output searchEndpoint string = 'https://${search.name}.search.windows.net'
 output contentSafetyEndpoint string = contentSafety.properties.endpoint
 output appInsightsConnectionString string = appInsights.properties.ConnectionString

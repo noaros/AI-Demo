@@ -8,6 +8,7 @@
     "searchLocation": { "value": "${AZURE_SEARCH_LOCATION}" },
     "apiExists": { "value": "${SERVICE_API_RESOURCE_EXISTS=false}" },
     "apiClientId": { "value": "${AZURE_API_CLIENT_ID}" },
-    "contentSafetyLocation": { "value": "${AZURE_CONTENT_SAFETY_LOCATION}" }
+    "contentSafetyLocation": { "value": "${AZURE_CONTENT_SAFETY_LOCATION}" },
+    "ciPrincipalId": { "value": "${AZURE_CI_PRINCIPAL_ID}" }
   }
 }

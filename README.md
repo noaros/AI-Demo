@@ -17,7 +17,7 @@ Each iteration has its own write-up in [`docs/iterations/`](docs/iterations/) co
 
 ## Getting started
 
-**Current iteration: [v9: Observability](docs/iterations/v9.md)**
+**Current iteration: [v10: Evaluations as a CI gate](docs/iterations/v10.md)**
 
 You need the [Azure Developer CLI](https://learn.microsoft.com/azure/developer/azure-developer-cli/install-azd) (`azd`), the [Azure CLI](https://learn.microsoft.com/cli/azure/install-azure-cli) (`az`), Python 3, an Azure subscription where you can create role assignments (Owner or User Access Administrator), and permission to create app registrations in its Entra ID tenant.
 
@@ -70,11 +70,20 @@ Messages and the text tools return are checked with Azure AI Content Safety: pro
 
 Every response includes `usage` (tokens and estimated cost) and a `trace_id`. Each request is traced in Application Insights: model calls with token counts, tools, searches, safety checks. See [v9](docs/iterations/v9.md) for queries.
 
+Evaluations check the agent against a golden dataset of 19 cases (answers, permissions, approvals, attacks), with deterministic checks and LLM judges. Run them with the azd values exported:
+
+```bash
+pip install -r evals/requirements.txt
+python -m evals.run          # about 4 minutes; exit code 1 if the gate fails
+```
+
+GitHub Actions runs them on pull requests once `python -m scripts.setup_ci <owner>/<repo>` has set up access. See [v10](docs/iterations/v10.md).
+
 After changing a policy, update the index without redeploying (with the azd values exported as above): `python -m scripts.ingest`.
 
 Conversations are stored in Cosmos DB for 7 days after their last message. Only the newest messages that fit in `HISTORY_TOKEN_BUDGET` tokens (default 2000) are sent to the model.
 
-The system prompt lives in [`prompts/`](prompts/). Set `PROMPT_NAME` to use a different prompt file (default `helpdesk-v6`).
+The system prompt lives in [`prompts/`](prompts/). Set `PROMPT_NAME` to use a different prompt file (default `helpdesk-v7`).
 
 To run the API locally against the same Azure resources (it uses your `azd`/`az` login, no keys):
 
@@ -104,7 +113,7 @@ azd down --purge
 | v6 | [Agent framework + write actions](docs/iterations/v6.md) | ✅ done |
 | v7 | [Human-in-the-loop approval + least privilege (signed-in user identity)](docs/iterations/v7.md) | ✅ done |
 | v8 | [Safety: Prompt Shields for direct and indirect injection, groundedness](docs/iterations/v8.md) | ✅ done |
-| v9 | [Observability: tracing, tokens and cost per request](docs/iterations/v9.md) | ✅ current |
-| v10 | Evaluations as a CI gate | planned |
+| v9 | [Observability: tracing, tokens and cost per request](docs/iterations/v9.md) | ✅ done |
+| v10 | [Evaluations as a CI gate](docs/iterations/v10.md) | ✅ current |
 | v11 | Resilience and cost control: AI gateway, failover, caching, agent step limits | planned |
 | v12 | Continuous improvement: feedback loop, red teaming | planned |

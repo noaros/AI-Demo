@@ -17,7 +17,7 @@ hooks:
     posix:
       shell: sh
       run: ./scripts/run.sh ingest
-  postdown: # app registrations live in Entra ID, not in the resource group: delete it separately
+  postdown: # app registrations live in Entra ID, not in the resource group: delete them separately
     posix:
       shell: sh
-      run: '[ -n "$AZURE_API_CLIENT_ID" ] && az ad app delete --id "$AZURE_API_CLIENT_ID" || true'
+      run: for id in "$AZURE_API_CLIENT_ID" "$AZURE_CI_CLIENT_ID"; do [ -n "$id" ] && az ad app delete --id "$id"; done; true

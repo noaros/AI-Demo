@@ -147,9 +147,14 @@ def start_turn(doc: dict, question: str, user: User) -> list[Message]:
     if doc.get("pending"):
         raise HTTPException(409, "An action is waiting for approval: approve or reject it with POST /chat/approve")
     history = trim_to_budget(doc["messages"], settings.history_token_budget)
-    who = (f"Signed-in user: {user.name}. Their account: {user.username}. "
-           f"Service Desk agent: {'yes' if user.is_agent else 'no'}.")
-    return [Message("system", [who]), *[Message(m["role"], [m["content"]]) for m in history], Message("user", [question])]
+    return [Message("system", [who_is(user)]), *[Message(m["role"], [m["content"]]) for m in history],
+            Message("user", [question])]
+
+
+def who_is(user: User) -> str:
+    """The first message of every conversation: the model needs to know who it's helping (evals use it too)."""
+    return (f"Signed-in user: {user.name}. Their account: {user.username}. "
+            f"Service Desk agent: {'yes' if user.is_agent else 'no'}.")
 
 
 def citations(answer: str, passages: list[Passage]) -> list[Citation]:

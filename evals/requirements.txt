@@ -1,0 +1,2 @@
+azure-ai-evaluation>=1.18
+pyyaml>=6
