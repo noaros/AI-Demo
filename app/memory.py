@@ -14,7 +14,8 @@ class NotYours(Exception):
 
 class SessionStore:
     """One Cosmos DB document per conversation:
-    {"id": <session id>, "owner": <user id>, "messages": [...], "pending": <turn waiting for approval> | null}
+    {"id": <session id>, "owner": <user id>, "messages": [...], "pending": <turn waiting for approval> | null,
+     "tokens_used": <every model call in this conversation, summed>}
 
     The session id is also the partition key, so every read and write is a cheap point operation.
     """
@@ -49,6 +50,9 @@ class SessionStore:
     def append(self, session_id: str, owner: str, *messages: dict) -> None:
         self._update(session_id, owner, [{"op": "add", "path": "/messages/-", "value": m} for m in messages],
                      {"messages": list(messages)})
+
+    def add_tokens(self, session_id: str, owner: str, tokens: int) -> None:
+        self._update(session_id, owner, [{"op": "incr", "path": "/tokens_used", "value": tokens}], {"tokens_used": tokens})
 
     def set_pending(self, session_id: str, owner: str, pending: dict | None) -> None:
         self._update(session_id, owner, [{"op": "set", "path": "/pending", "value": pending}], {"pending": pending})

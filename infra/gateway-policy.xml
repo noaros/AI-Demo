@@ -1,0 +1,52 @@
+<!-- Runs in API Management for every model call the app makes. __name__ values are filled in by gateway.bicep. -->
+<policies>
+  <inbound>
+    <base />
+    <!-- Who may call: an Entra ID token for Azure OpenAI, from one of the listed identities (the app, you).
+         Any other identity in the tenant can get such a token, so the object id (oid) is checked too. -->
+    <validate-azure-ad-token tenant-id="__tenantId__">
+      <audiences>
+        <audience>https://cognitiveservices.azure.com</audience>
+      </audiences>
+      <required-claims>
+        <claim name="oid" match="any">__allowedCallers__</claim>
+      </required-claims>
+    </validate-azure-ad-token>
+    <!-- Tokens per minute for each end user. The app says who it's calling for in x-user-id; without it the
+         limit falls on the caller's own identity. Over the limit: 429, with Retry-After, before any model runs. -->
+    <llm-token-limit
+        counter-key="@(context.Request.Headers.GetValueOrDefault("x-user-id", context.Request.Headers.GetValueOrDefault("Authorization", "").AsJwt()?.Claims.GetValueOrDefault("oid", "unknown")))"
+        tokens-per-minute="__tokensPerMinute__" estimate-prompt-tokens="true"
+        remaining-tokens-header-name="x-ratelimit-remaining-user-tokens" />
+    <!-- Then sign in to Azure OpenAI as the gateway itself: the caller's token never reaches the model. -->
+    <authentication-managed-identity resource="https://cognitiveservices.azure.com" />
+    <set-backend-service backend-id="openai-pool" />
+  </inbound>
+  <backend>
+    <!-- A region that's throttling (429) or failing (5xx) trips its circuit breaker; the retry then goes to the
+         next region in the pool. The user sees a slower answer, not an error. -->
+    <retry condition="@(context.Response.StatusCode == 429 || context.Response.StatusCode >= 500)"
+           count="2" interval="0" first-fast-retry="true">
+      <forward-request buffer-request-body="true" />
+    </retry>
+  </backend>
+  <outbound>
+    <base />
+    <!-- Which region answered, so the app can put it on its trace. -->
+    <set-header name="x-served-by" exists-action="override">
+      <value>@(context.Request.Url.Host)</value>
+    </set-header>
+  </outbound>
+  <on-error>
+    <base />
+    <!-- 429: this user is over their limit. 503: every region is throttling or failing (all circuits open).
+         Neither clears for up to a minute: tell the client not to sit retrying. Retry-After says when. -->
+    <choose>
+      <when condition="@(context.Response.StatusCode == 429 || context.Response.StatusCode == 503)">
+        <set-header name="x-should-retry" exists-action="override">
+          <value>false</value>
+        </set-header>
+      </when>
+    </choose>
+  </on-error>
+</policies>

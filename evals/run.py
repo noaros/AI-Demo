@@ -46,6 +46,9 @@ JUDGE_WORKERS = 4  # cases judged at the same time; each runs up to 4 judges. Si
 
 
 def load_app():
+    # Straight to Azure OpenAI, not through the AI gateway (v11): evals measure the agent, and every case runs as
+    # one of two test users, who would soon hit the gateway's per-user token limit.
+    os.environ.pop("AI_GATEWAY_ENDPOINT", None)
     import app.main as m
     from app.auth import AGENT_ROLE, User, current_user
 

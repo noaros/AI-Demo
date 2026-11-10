@@ -27,6 +27,12 @@ param contentSafetyLocation string = ''
 @description('Service principal GitHub Actions signs in as to run the evaluations. Set by scripts/setup_ci.py.')
 param ciPrincipalId string = ''
 
+@description('Region of the second Azure OpenAI account, which the gateway fails over to.')
+param openAiSecondaryLocation string = 'swedencentral'
+
+@description('Tokens per minute each user may use, enforced by the gateway. Keep it below the models\' total (2 regions x 10,000), or one user can starve the rest.')
+param tokensPerMinutePerUser int = 10000
+
 param openAiModelName string = 'gpt-5-mini'
 param openAiModelVersion string = '2025-08-07'
 param embeddingModelName string = 'text-embedding-3-small'
@@ -56,12 +62,15 @@ module resources 'resources.bicep' = {
     openAiModelVersion: openAiModelVersion
     embeddingModelName: embeddingModelName
     embeddingModelVersion: embeddingModelVersion
+    openAiSecondaryLocation: openAiSecondaryLocation
+    tokensPerMinutePerUser: tokensPerMinutePerUser
   }
 }
 
 // azd stores these in .azure/<env>/.env; `azd env get-values` prints them.
 output AZURE_CONTAINER_REGISTRY_ENDPOINT string = resources.outputs.registryLoginServer
 output AZURE_OPENAI_ENDPOINT string = resources.outputs.openAiEndpoint
+output AI_GATEWAY_ENDPOINT string = resources.outputs.gatewayEndpoint
 output AZURE_OPENAI_DEPLOYMENT string = resources.outputs.openAiDeployment
 output AZURE_COSMOS_ENDPOINT string = resources.outputs.cosmosEndpoint
 output AZURE_OPENAI_EMBEDDING_DEPLOYMENT string = resources.outputs.embeddingDeployment

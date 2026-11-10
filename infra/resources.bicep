@@ -10,6 +10,8 @@ param openAiModelName string
 param openAiModelVersion string
 param embeddingModelName string
 param embeddingModelVersion string
+param openAiSecondaryLocation string
+param tokensPerMinutePerUser int
 
 var token = uniqueString(subscription().id, resourceGroup().id, location)
 
@@ -97,6 +99,55 @@ resource devOpenAiAccess 'Microsoft.Authorization/roleAssignments@2022-04-01' = 
     principalType: 'User'
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', openAiUserRole)
   }
+}
+
+// A second Azure OpenAI account in another region, with the same deployments: where the gateway sends requests
+// when the first one throttles or fails. Idle deployments cost nothing (pay per token).
+resource openAiSecondary 'Microsoft.CognitiveServices/accounts@2024-10-01' = {
+  name: 'oai-${token}-2'
+  location: openAiSecondaryLocation
+  tags: tags
+  kind: 'OpenAI'
+  sku: { name: 'S0' }
+  properties: {
+    customSubDomainName: 'oai-${token}-2'
+    disableLocalAuth: true
+    publicNetworkAccess: 'Enabled'
+  }
+}
+
+resource chatDeploymentSecondary 'Microsoft.CognitiveServices/accounts/deployments@2024-10-01' = {
+  parent: openAiSecondary
+  name: chatDeployment.name
+  sku: { name: 'GlobalStandard', capacity: 10 }
+  properties: {
+    model: { format: 'OpenAI', name: openAiModelName, version: openAiModelVersion }
+  }
+}
+
+resource embeddingDeploymentSecondary 'Microsoft.CognitiveServices/accounts/deployments@2024-10-01' = {
+  parent: openAiSecondary
+  name: embeddingDeployment.name
+  dependsOn: [chatDeploymentSecondary]
+  sku: { name: 'GlobalStandard', capacity: 50 }
+  properties: {
+    model: { format: 'OpenAI', name: embeddingModelName, version: embeddingModelVersion }
+  }
+}
+
+// ---------- AI gateway: API Management between the app and the models (gateway.bicep) ----------
+
+module gateway 'gateway.bicep' = {
+  name: 'gateway'
+  params: {
+    location: location
+    tags: tags
+    token: token
+    openAiAccounts: [openAi.name, openAiSecondary.name]
+    allowedCallers: empty(principalId) ? [identity.properties.principalId] : [identity.properties.principalId, principalId]
+    tokensPerMinutePerUser: tokensPerMinutePerUser
+  }
+  dependsOn: [chatDeploymentSecondary, embeddingDeploymentSecondary, judgeDeployment]
 }
 
 // ---------- Cosmos DB: conversation history, also with keys switched off ----------
@@ -396,6 +447,7 @@ resource api 'Microsoft.App/containerApps@2024-03-01' = {
           env: [
             { name: 'AZURE_OPENAI_ENDPOINT', value: openAi.properties.endpoint }
             { name: 'AZURE_OPENAI_DEPLOYMENT', value: chatDeployment.name }
+            { name: 'AI_GATEWAY_ENDPOINT', value: gateway.outputs.endpoint } // model calls go here, not to AZURE_OPENAI_ENDPOINT
             { name: 'AZURE_COSMOS_ENDPOINT', value: cosmos.properties.documentEndpoint }
             { name: 'AZURE_OPENAI_EMBEDDING_DEPLOYMENT', value: embeddingDeployment.name }
             { name: 'AZURE_SEARCH_ENDPOINT', value: 'https://${search.name}.search.windows.net' }
@@ -421,4 +473,5 @@ output judgeDeployment string = judgeDeployment.name
 output searchEndpoint string = 'https://${search.name}.search.windows.net'
 output contentSafetyEndpoint string = contentSafety.properties.endpoint
 output appInsightsConnectionString string = appInsights.properties.ConnectionString
+output gatewayEndpoint string = gateway.outputs.endpoint
 output apiUri string = 'https://${api.properties.configuration.ingress.fqdn}'

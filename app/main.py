@@ -3,15 +3,20 @@ import dataclasses
 import logging
 import re
 from collections.abc import AsyncIterator
+from contextvars import ContextVar
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from typing import Literal
 from uuid import UUID, uuid4
 
+import openai
 from agent_framework import AgentResponse, AgentSession, Content, Message
+from agent_framework.exceptions import ChatClientException
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 from fastapi import Depends, FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from opentelemetry import trace
-from openai import AsyncOpenAI, OpenAI
+from openai import AsyncOpenAI, DefaultAsyncHttpxClient, DefaultHttpxClient, OpenAI
 from pydantic import BaseModel, Field
 
 from app.agent import Toolbox, build_agent
@@ -44,16 +49,48 @@ async def async_token_provider() -> str:  # the async OpenAI client needs an asy
     return await asyncio.to_thread(token_provider)
 
 
-openai_base_url = f"{settings.openai_endpoint}/openai/v1/"
+# The user each model call is for. The gateway limits tokens per user, so every call says who it's for.
+calling_for: ContextVar[str | None] = ContextVar("calling_for", default=None)
+
+
+def tag_request(request) -> None:
+    if user_id := calling_for.get():
+        request.headers["x-user-id"] = user_id
+
+
+def note_region(response) -> None:
+    if region := response.headers.get("x-served-by"):  # set by the gateway: which Azure OpenAI account answered
+        logging.getLogger("agent").info("model call served by %s", region)
+        annotate(served_by=region)  # the request's last model call
+
+
+async def tag_request_async(request) -> None:
+    tag_request(request)
+
+
+async def note_region_async(response) -> None:
+    note_region(response)
+
+
+# Through the AI gateway when there is one: it limits tokens per user and fails over between regions.
+openai_base_url = f"{settings.ai_gateway_endpoint or settings.openai_endpoint}/openai/v1/"
+# A model call that takes longer than this is abandoned (the default is 10 minutes). Retries: 2, with backoff,
+# for timeouts, 429s and 5xx errors, except where the gateway says not to (its per-user limit).
+MODEL_CALL_TIMEOUT = 30
 sessions = SessionStore(settings.cosmos_endpoint, credential)
 desk = ServiceDesk(settings.cosmos_endpoint, credential)
 policies = PolicySearch(
-    settings.search_endpoint, credential, OpenAI(base_url=openai_base_url, api_key=token_provider),
+    settings.search_endpoint, credential,
+    OpenAI(base_url=openai_base_url, api_key=token_provider, timeout=MODEL_CALL_TIMEOUT,
+           http_client=DefaultHttpxClient(event_hooks={"request": [tag_request], "response": [note_region]})),
     settings.embedding_deployment,
 )
 safety = ContentSafety(settings.content_safety_endpoint, async_token_provider, enabled=settings.safety_checks)
 agent = build_agent(
-    AsyncOpenAI(base_url=openai_base_url, api_key=async_token_provider), settings.openai_deployment, prompt.text
+    AsyncOpenAI(base_url=openai_base_url, api_key=async_token_provider, timeout=MODEL_CALL_TIMEOUT,
+                http_client=DefaultAsyncHttpxClient(event_hooks={"request": [tag_request_async],
+                                                                 "response": [note_region_async]})),
+    settings.openai_deployment, prompt.text,
 )
 
 app = FastAPI(title="Contoso IT Helpdesk")
@@ -63,6 +100,41 @@ app = FastAPI(title="Contoso IT Helpdesk")
 async def remember_request_span(request, call_next):
     telemetry.request_span.set(trace.get_current_span())  # runs inside the request's span
     return await call_next(request)
+
+
+@app.exception_handler(ChatClientException)
+async def model_unavailable(request, exc: ChatClientException) -> JSONResponse:
+    """The model couldn't be reached, even after retries and failover. Say so plainly, and when to try again."""
+    cause = exc.__cause__
+    logging.getLogger("agent").warning("model call failed: %r", cause)
+    status = cause.status_code if isinstance(cause, openai.APIStatusError) else None
+    if status in (429, 503):  # 429: this user is over their limit; 503: every region is busy (the gateway's pool)
+        retry_after = seconds_until(cause.response.headers.get("retry-after"))
+        annotate(blocked="rate_limited" if status == 429 else "no_capacity")
+        detail = "You've sent too many questions" if status == 429 else "The assistant is busy"
+        return error(status, f"{detail}: try again in {retry_after} seconds", {"Retry-After": str(retry_after)})
+    if isinstance(cause, openai.APITimeoutError):
+        return error(504, "The model took too long to answer: try again")
+    return error(502, "The model is unavailable")
+
+
+@app.exception_handler(TimeoutError)
+async def turn_too_slow(request, exc: TimeoutError) -> JSONResponse:
+    annotate(blocked="turn_timeout")
+    return error(504, f"No answer within {settings.turn_timeout_seconds:.0f} seconds: try again")
+
+
+def error(status: int, detail: str, headers: dict | None = None) -> JSONResponse:
+    return JSONResponse({"detail": detail, "trace_id": current_trace_id()}, status, headers=headers)
+
+
+def seconds_until(retry_after: str | None) -> int:
+    """Retry-After is either seconds or a date (the gateway's pool sends a date)."""
+    if not retry_after:
+        return 60
+    if retry_after.isdigit():
+        return int(retry_after)
+    return max(1, int((parsedate_to_datetime(retry_after) - datetime.now(UTC)).total_seconds()))
 
 
 class ChatRequest(BaseModel):
@@ -142,6 +214,17 @@ def load_session(session_id: UUID | None, user: User) -> dict:
         raise HTTPException(404, "No such session") from None  # someone else's session looks like no session
 
 
+async def open_session(session_id: UUID | None, user: User) -> dict:
+    """The session a new turn runs in, if it still has budget left."""
+    doc = await asyncio.to_thread(load_session, session_id, user)  # Cosmos DB client is synchronous
+    if doc.get("tokens_used", 0) >= settings.session_token_budget:
+        # An agent can loop, and a person (or a script) can keep a conversation going forever. Each costs money.
+        raise HTTPException(429, f"This conversation has used its budget of {settings.session_token_budget} "
+                                 "tokens: start a new one")
+    calling_for.set(user.id)  # model calls from here on count against this user's limit at the gateway
+    return doc
+
+
 def start_turn(doc: dict, question: str, user: User) -> list[Message]:
     """Who's asking, the trimmed history and the new question: the conversation sent to the model."""
     if doc.get("pending"):
@@ -175,6 +258,12 @@ def usage_of(response: AgentResponse) -> Usage | None:
     tokens_in, tokens_out = details["input_token_count"], details.get("output_token_count") or 0
     cost = (tokens_in * settings.price_input_per_million + tokens_out * settings.price_output_per_million) / 1e6
     return Usage(input_tokens=tokens_in, output_tokens=tokens_out, estimated_cost_usd=round(cost, 6))
+
+
+async def charge(doc: dict, user: User, usage: Usage | None) -> None:
+    """Adds the turn's tokens to the conversation's total, which the session budget is checked against."""
+    if usage:
+        await asyncio.to_thread(sessions.add_tokens, doc["id"], user.id, usage.input_tokens + usage.output_tokens)
 
 
 def record_turn(user: User, session_id: str, status: str, usage: Usage | None, toolbox: Toolbox) -> None:
@@ -250,6 +339,7 @@ async def answer_or_park(doc: dict, user: User, question: str, session: AgentSes
     usage = usage_of(response)
     if response.user_input_requests:
         await park_turn(doc, user, question, session, toolbox, response)
+        await charge(doc, user, usage)
         actions = await pending_actions(response, user, said_by_user(doc, question), toolbox.results)
         record_turn(user, doc["id"], "approval_required", usage, toolbox)
         return ApprovalRequired(session_id=doc["id"], actions=actions, tool_calls=toolbox.calls, usage=usage,
@@ -258,6 +348,7 @@ async def answer_or_park(doc: dict, user: User, question: str, session: AgentSes
     if parsed is None:  # the model refused, or ran out of tokens mid-JSON
         raise HTTPException(status_code=502, detail="Model did not return a valid answer")
     await finish_turn(doc, user, question, parsed.answer)
+    await charge(doc, user, usage)
     record_turn(user, doc["id"], "answered", usage, toolbox)
     return ChatResponse(
         **parsed.model_dump(),
@@ -271,6 +362,18 @@ async def answer_or_park(doc: dict, user: User, question: str, session: AgentSes
     )
 
 
+async def run_agent(messages: list[Message], session: AgentSession, toolbox: Toolbox) -> AgentResponse:
+    """One turn of the agent: up to MAX_STEPS model calls (agent.py), each with retries, all within the deadline."""
+    async with asyncio.timeout(settings.turn_timeout_seconds):
+        return await agent.run(
+            messages,
+            session=session,
+            tools=toolbox.tools(),
+            middleware=[toolbox.record_tool_call],
+            options={"response_format": HelpdeskAnswer, "reasoning_effort": "low"},
+        )
+
+
 @app.get("/healthz")
 def healthz() -> dict:
     return {"status": "ok"}
@@ -280,24 +383,18 @@ def healthz() -> dict:
 async def chat(request: ChatRequest, user: User = Depends(current_user)) -> ChatResponse | ApprovalRequired:
     """For other systems: a typed answer they can route on, or the actions waiting for the user's approval."""
     await check_question(request.question)
-    doc = await asyncio.to_thread(load_session, request.session_id, user)  # Cosmos DB client is synchronous
+    doc = await open_session(request.session_id, user)
     messages = start_turn(doc, request.question, user)
     session = agent.create_session()  # the framework's state for this turn; it holds pending approvals
     toolbox = Toolbox(policies, desk, safety, user)
-    response = await agent.run(
-        messages,
-        session=session,
-        tools=toolbox.tools(),
-        middleware=[toolbox.record_tool_call],
-        options={"response_format": HelpdeskAnswer, "reasoning_effort": "low"},
-    )
+    response = await run_agent(messages, session, toolbox)
     return await answer_or_park(doc, user, request.question, session, toolbox, response, len(messages) - 2)
 
 
 @app.post("/chat/approve")
 async def approve(request: ApprovalRequest, user: User = Depends(current_user)) -> ChatResponse | ApprovalRequired:
     """Approve or reject the actions the agent asked to take, and let it finish its answer."""
-    doc = await asyncio.to_thread(load_session, request.session_id, user)
+    doc = await open_session(request.session_id, user)
     pending = doc.get("pending")
     if not pending:
         raise HTTPException(409, "Nothing is waiting for approval in this session")
@@ -310,12 +407,8 @@ async def approve(request: ApprovalRequest, user: User = Depends(current_user)) 
     session = AgentSession.from_dict(pending["session"])
     toolbox = Toolbox(policies, desk, safety, user, passages=[Passage(**p) for p in pending["passages"]],
                       results=pending["results"])
-    response = await agent.run(
-        [Message("user", [r.to_function_approval_response(request.decisions[r.id]) for r in requests])],
-        session=session,
-        tools=toolbox.tools(),
-        middleware=[toolbox.record_tool_call],
-        options={"response_format": HelpdeskAnswer, "reasoning_effort": "low"},
+    response = await run_agent(
+        [Message("user", [r.to_function_approval_response(request.decisions[r.id]) for r in requests])], session, toolbox
     )
     return await answer_or_park(doc, user, pending["question"], session, toolbox, response, pending["history_sent"])
 
@@ -324,7 +417,7 @@ async def approve(request: ApprovalRequest, user: User = Depends(current_user)) 
 async def chat_stream(request: ChatRequest, user: User = Depends(current_user)) -> StreamingResponse:
     """For people: plain text that appears as it's generated, then the sources it cited."""
     await check_question(request.question)
-    doc = await asyncio.to_thread(load_session, request.session_id, user)
+    doc = await open_session(request.session_id, user)
     messages = start_turn(doc, request.question, user)
     session = agent.create_session()
     toolbox = Toolbox(policies, desk, safety, user)
@@ -342,6 +435,7 @@ async def chat_stream(request: ChatRequest, user: User = Depends(current_user)) 
             if update.text:
                 yield update.text
         response = await stream.get_final_response()
+        await charge(doc, user, usage_of(response))
         record_turn(user, doc["id"], "approval_required" if response.user_input_requests else "answered",
                     usage_of(response), toolbox)
         if response.user_input_requests:

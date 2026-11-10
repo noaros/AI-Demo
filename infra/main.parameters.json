@@ -9,6 +9,8 @@
     "apiExists": { "value": "${SERVICE_API_RESOURCE_EXISTS=false}" },
     "apiClientId": { "value": "${AZURE_API_CLIENT_ID}" },
     "contentSafetyLocation": { "value": "${AZURE_CONTENT_SAFETY_LOCATION}" },
-    "ciPrincipalId": { "value": "${AZURE_CI_PRINCIPAL_ID}" }
+    "ciPrincipalId": { "value": "${AZURE_CI_PRINCIPAL_ID}" },
+    "openAiSecondaryLocation": { "value": "${AZURE_OPENAI_SECONDARY_LOCATION=swedencentral}" },
+    "tokensPerMinutePerUser": { "value": "${GATEWAY_TOKENS_PER_MINUTE=10000}" }
   }
 }

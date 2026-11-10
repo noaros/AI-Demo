@@ -17,7 +17,7 @@ Each iteration has its own write-up in [`docs/iterations/`](docs/iterations/) co
 
 ## Getting started
 
-**Current iteration: [v10: Evaluations as a CI gate](docs/iterations/v10.md)**
+**Current iteration: [v11: Resilience and cost control](docs/iterations/v11.md)**
 
 You need the [Azure Developer CLI](https://learn.microsoft.com/azure/developer/azure-developer-cli/install-azd) (`azd`), the [Azure CLI](https://learn.microsoft.com/cli/azure/install-azure-cli) (`az`), Python 3, an Azure subscription where you can create role assignments (Owner or User Access Administrator), and permission to create app registrations in its Entra ID tenant.
 
@@ -79,6 +79,8 @@ python -m evals.run          # about 4 minutes; exit code 1 if the gate fails
 
 GitHub Actions runs them on pull requests once `python -m scripts.setup_ci <owner>/<repo>` has set up access. See [v10](docs/iterations/v10.md).
 
+The app doesn't call Azure OpenAI directly: every model call goes through an AI gateway (Azure API Management) that limits each user to `GATEWAY_TOKENS_PER_MINUTE` tokens a minute (default 10000) and fails over to a second Azure OpenAI region (`AZURE_OPENAI_SECONDARY_LOCATION`, default `swedencentral`) when the first throttles or fails. In the app, a question gets at most `TURN_TIMEOUT_SECONDS` (default 60) and a conversation at most `SESSION_TOKEN_BUDGET` tokens (default 100000). Over a limit, you get a 429 or 504 that says when to try again. See it with `python -m scripts.burst 10`, and read [v11](docs/iterations/v11.md).
+
 After changing a policy, update the index without redeploying (with the azd values exported as above): `python -m scripts.ingest`.
 
 Conversations are stored in Cosmos DB for 7 days after their last message. Only the newest messages that fit in `HISTORY_TOKEN_BUDGET` tokens (default 2000) are sent to the model.
@@ -94,7 +96,7 @@ azd env get-values > .env
 uvicorn app.main:app --reload --env-file .env    # then call http://localhost:8000 with the same token
 ```
 
-When you're done, remove everything. AI Search bills by the hour even when idle, so don't leave it running. `azd down` also deletes the app registration:
+When you're done, remove everything. AI Search and API Management bill by the hour even when idle, so don't leave them running. `azd down` also deletes the app registration:
 
 ```bash
 azd down --purge
@@ -114,6 +116,6 @@ azd down --purge
 | v7 | [Human-in-the-loop approval + least privilege (signed-in user identity)](docs/iterations/v7.md) | ✅ done |
 | v8 | [Safety: Prompt Shields for direct and indirect injection, groundedness](docs/iterations/v8.md) | ✅ done |
 | v9 | [Observability: tracing, tokens and cost per request](docs/iterations/v9.md) | ✅ done |
-| v10 | [Evaluations as a CI gate](docs/iterations/v10.md) | ✅ current |
-| v11 | Resilience and cost control: AI gateway, failover, caching, agent step limits | planned |
+| v10 | [Evaluations as a CI gate](docs/iterations/v10.md) | ✅ done |
+| v11 | [Resilience and cost control: AI gateway, per-user limits, failover, budgets](docs/iterations/v11.md) | ✅ current |
 | v12 | Continuous improvement: feedback loop, red teaming | planned |
