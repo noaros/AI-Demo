@@ -26,8 +26,17 @@ def main(repo: str) -> None:
     sp = sps[0] if sps else graph("POST", "/servicePrincipals", {"appId": app["appId"]})
 
     # Which GitHub workflow runs may sign in as this identity: pull requests, and runs on main.
-    existing = {c["subject"] for c in graph("GET", f"/applications/{app['id']}/federatedIdentityCredentials")["value"]}
-    for label, subject in [("pull-requests", f"repo:{repo}:pull_request"), ("main", f"repo:{repo}:ref:refs/heads/main")]:
+    # Newer repositories use "immutable" subjects (repo:owner@<id>/name@<id>:...), so ask GitHub for the prefix.
+    prefix = subprocess.run(["gh", "api", f"repos/{repo}/actions/oidc/customization/sub", "-q", ".sub_claim_prefix"],
+                            capture_output=True, text=True).stdout.strip() or f"repo:{repo}"
+    wanted = {"pull-requests": f"{prefix}:pull_request", "main": f"{prefix}:ref:refs/heads/main"}
+    existing = {}
+    for c in graph("GET", f"/applications/{app['id']}/federatedIdentityCredentials")["value"]:
+        if c["subject"] in wanted.values():
+            existing[c["subject"]] = c
+        else:  # stale, e.g. the old subject format
+            graph("DELETE", f"/applications/{app['id']}/federatedIdentityCredentials/{c['id']}")
+    for label, subject in wanted.items():
         if subject not in existing:
             graph("POST", f"/applications/{app['id']}/federatedIdentityCredentials", {
                 "name": f"github-{label}", "issuer": GITHUB_ISSUER, "subject": subject,
